@@ -5,6 +5,7 @@ import PicasaCore
 enum SidebarItem: Hashable {
     case filter(MediaFilter, String)
     case people
+    case labels
 }
 
 @MainActor
@@ -12,10 +13,15 @@ final class AppModel: ObservableObject {
     let library: Library
     @Published var selection: SidebarItem? = .filter(.all, "All photos")
     @Published var search = ""
+    /// Search tokens (people, labels, albums), combined with AND, plus the free text in `search`.
+    @Published var tokens: [SearchTerm] = []
+    /// Known people/labels/albums for autocompletion in the token field.
+    @Published var vocabulary: [SearchTerm] = []
     @Published var ids: [Int64] = []
     @Published var folders: [FolderNode] = []
     @Published var years: [(year: Int, count: Int)] = []
     @Published var persons: [PersonSummary] = []
+    @Published var clusters: [FaceCluster] = []
     @Published var albums: [AlbumSummary] = []
     @Published var stats: Library.Stats?
     /// Viewer state: its own snapshot of ids, so grid reloads cannot shift what is being viewed.
@@ -37,8 +43,10 @@ final class AppModel: ObservableObject {
         Task { await refreshAll() }
     }
 
+    var isSearching: Bool { !tokens.isEmpty || !search.trimmingCharacters(in: .whitespaces).isEmpty }
+
     var currentFilter: MediaFilter {
-        if !search.trimmingCharacters(in: .whitespaces).isEmpty { return .search(search) }
+        if isSearching { return .query(tokens, search) }
         if case let .filter(f, _)? = selection { return f }
         return .all
     }
@@ -48,6 +56,8 @@ final class AppModel: ObservableObject {
             folders = try await library.folders()
             years = try await library.years()
             persons = try await library.persons()
+            vocabulary = try await library.searchVocabulary()
+            clusters = try await library.unnamedClusters()
             albums = try await library.albums()
             stats = try await library.stats()
         } catch { self.error = "\(error)" }
@@ -61,8 +71,23 @@ final class AppModel: ObservableObject {
     }
 
     func reloadGrid() async {
-        if case .people? = selection, search.isEmpty { return }
+        if !isSearching, selection == .people || selection == .labels { return }
         do { ids = try await library.mediaIds(currentFilter) } catch { self.error = "\(error)"; ids = [] }
+    }
+
+    /// Called by the token field on every edit.
+    func setQuery(tokens: [SearchTerm], text: String) {
+        guard tokens != self.tokens || text != search else { return }
+        self.tokens = tokens
+        search = text
+        Task { await reloadGrid() }
+    }
+
+    /// Choosing another sidebar entry leaves the search.
+    func clearSearch() {
+        guard isSearching else { return }
+        tokens = []
+        search = ""
     }
 
     // MARK: - Background jobs
@@ -85,7 +110,8 @@ final class AppModel: ObservableObject {
 
     func rescan() {
         runJob("Rescanning") { lib, report in
-            for r in try await lib.roots() {
+            // Missing roots (unplugged disk) are skipped, never pruned.
+            for r in try await lib.roots() where FileManager.default.fileExists(atPath: r.path) {
                 _ = try await Scanner(library: lib).scan(root: URL(fileURLWithPath: r.path)) { report($0) }
             }
             try await Self.index(lib, report)
@@ -115,9 +141,9 @@ final class AppModel: ObservableObject {
         let ix = Indexer(library: lib)
         _ = try await ix.extractMetadata { report($0) }
         _ = try await ix.generateThumbnails { report($0) }
-        let faces = FaceEngine(library: lib, concurrency: max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
-        _ = try await faces.detectPending { report($0) }
-        _ = try await faces.suggestNames()
+        _ = try await Analyzer(library: lib, concurrency: max(1, ProcessInfo.processInfo.activeProcessorCount / 2)).run { report($0) }
+        _ = try await FaceEngine(library: lib).suggestNames()
+        try await lib.groupSimilar()
     }
 
     private func runJob(_ title: String, _ body: @escaping @Sendable (Library, @escaping ProgressHandler) async throws -> Void) {
@@ -140,6 +166,15 @@ final class AppModel: ObservableObject {
 
     func toggleStar(_ item: MediaItem) async {
         try? await library.setStar([item.id], !item.star)
+    }
+
+    /// Names a group of faces, then refreshes suggestions so similar faces get proposed.
+    func name(faces: [Int64], as name: String) async {
+        do {
+            try await library.nameFaces(faces, name: name)
+            _ = try await FaceEngine(library: library).suggestNames()
+        } catch { self.error = "\(error)" }
+        await refreshAll()
     }
 
     func confirmAll(_ p: PersonSummary) async {

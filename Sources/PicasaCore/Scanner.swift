@@ -40,6 +40,16 @@ public struct Scanner: Sendable {
     }
 
     struct Entry: Sendable { let name: String; let kind: MediaKind; let size: Int64; let mtime: Double }
+
+    /// Folders not to descend into: names (case-insensitive) and absolute path prefixes.
+    struct Exclusions: Sendable {
+        var names: Set<String>
+        var prefixes: [String]
+        func excludes(_ url: URL) -> Bool {
+            names.contains(url.lastPathComponent.lowercased())
+                || prefixes.contains { url.path == $0 || url.path.hasPrefix($0 + "/") }
+        }
+    }
     struct FolderListing: Sendable {
         let path: String; let mtime: Double; let entries: [Entry]; let subfolders: [URL]
         let ini: (url: URL, mtime: Double)?
@@ -48,19 +58,22 @@ public struct Scanner: Sendable {
     public struct Result: Sendable { public var folders = 0, added = 0, updated = 0, removed = 0, iniParsed = 0 }
 
     public func scan(root: URL, progress: ProgressHandler? = nil) async throws -> Result {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: root.path])
+        }
         let rootId = try await library.addRoot(root)
+        let user = try await library.excludes()
+        let exclusions = Exclusions(
+            names: Library.defaultExcludedNames.union(user.filter { !$0.hasPrefix("/") }.map { $0.lowercased() }),
+            prefixes: user.filter { $0.hasPrefix("/") }.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         var result = Result()
         var seenFolders = Set<String>()
         var unreadable: [String] = []
         var queue = [root.standardizedFileURL]
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
-            throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: root.path])
-        }
 
         // An unmounted volume can leave an empty /Volumes/X stub: refuse to treat it as "everything deleted".
-        if let rootListing = Self.list(root.standardizedFileURL, skipHidden: skipHiddenFolders),
+        if let rootListing = Self.list(root.standardizedFileURL, skipHidden: skipHiddenFolders, excluded: exclusions),
            rootListing.entries.isEmpty, rootListing.subfolders.isEmpty, try await library.mediaCount(rootId: rootId) > 0 {
             throw CocoaError(.fileReadUnknown, userInfo: [NSLocalizedDescriptionKey:
                 "\(root.path) is empty but the library holds media for it (disk not mounted?). Nothing was changed."])
@@ -71,7 +84,7 @@ public struct Scanner: Sendable {
             func launch() {
                 while inFlight < concurrency, let next = queue.popLast() {
                     inFlight += 1
-                    group.addTask { [skipHiddenFolders] in (next.path, Self.list(next, skipHidden: skipHiddenFolders)) }
+                    group.addTask { [skipHiddenFolders] in (next.path, Self.list(next, skipHidden: skipHiddenFolders, excluded: exclusions)) }
                 }
             }
             launch()
@@ -95,7 +108,8 @@ public struct Scanner: Sendable {
         return result
     }
 
-    static func list(_ dir: URL, skipHidden: Bool) -> FolderListing? {
+    /// Excluded folders are not listed, so anything indexed under them before is pruned from the library.
+    static func list(_ dir: URL, skipHidden: Bool, excluded: Exclusions) -> FolderListing? {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey, .isPackageKey]
         guard let items = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: []) else { return nil }
         let dirMtime = (try? dir.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate?.timeIntervalSince1970) ?? 0
@@ -112,6 +126,7 @@ public struct Scanner: Sendable {
                 if v.isPackage == true { continue } // .photoslibrary, .app, …
                 if name.hasPrefix(".") && (skipHidden || name == ".picasaoriginals") { continue }
                 if name == "$RECYCLE.BIN" || name == "System Volume Information" || name == "@eaDir" { continue }
+                if excluded.excludes(u) { continue }
                 subs.append(u)
                 continue
             }
@@ -159,16 +174,20 @@ extension Library {
                 if let old = existing.removeValue(forKey: e.name) {
                     if old.size != e.size || abs(old.mtime - e.mtime) > 0.001 {
                         // Content changed: redo metadata/thumbnail/faces.
-                        try db.run("UPDATE media SET size=?, mtime=?, meta_state=0, thumb_state=0, face_state=? WHERE id=?",
-                                   e.size, e.mtime, e.kind == .video ? 3 : 0, old.id)
+                        let na = e.kind == .video ? 3 : 0
+                        try db.run("UPDATE media SET size=?, mtime=?, meta_state=0, thumb_state=0, face_state=?, analysis_state=?, print=NULL, aesthetic=NULL, utility=0 WHERE id=?",
+                                   e.size, e.mtime, na, na, old.id)
+                        try db.run("DELETE FROM labels WHERE media_id = ?", old.id)
+                        try db.run("DELETE FROM animals WHERE media_id = ?", old.id)
                         try db.run("DELETE FROM faces WHERE media_id = ? AND source = ? AND person_id IS NULL", old.id, FaceSource.vision.rawValue)
                         try db.run("UPDATE faces SET print = NULL WHERE media_id = ?", old.id)
                         r.updated += 1
                     }
                 } else {
-                    // face_state 3 = not applicable (videos are not face-scanned).
-                    try db.run("INSERT INTO media(folder_id, name, kind, size, mtime, face_state) VALUES(?, ?, ?, ?, ?, ?)",
-                               folderId, e.name, e.kind.rawValue, e.size, e.mtime, e.kind == .video ? 3 : 0)
+                    // face/analysis state 3 = not applicable (videos are not analysed).
+                    let na = e.kind == .video ? 3 : 0
+                    try db.run("INSERT INTO media(folder_id, name, kind, size, mtime, face_state, analysis_state) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                               folderId, e.name, e.kind.rawValue, e.size, e.mtime, na, na)
                     r.added += 1
                 }
             }

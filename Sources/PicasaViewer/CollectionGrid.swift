@@ -43,6 +43,7 @@ struct CollectionGrid: NSViewRepresentable {
         c.apply(size: cellSize)
     }
 
+    @MainActor
     final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout, NSCollectionViewPrefetching {
         var parent: CollectionGrid
         weak var view: NSCollectionView?

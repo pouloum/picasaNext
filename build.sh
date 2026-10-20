@@ -30,6 +30,12 @@ APP="$OUT/PicasaNext.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 "${SWIFTC[@]}" -parse-as-library -module-name PicasaViewer -o "$APP/Contents/MacOS/PicasaNext" Sources/PicasaViewer/*.swift -lPicasaCore -lPicasaFormats -lsqlite3
 cp Resources/Info.plist "$APP/Contents/Info.plist" 2>/dev/null || true
+# App icon, drawn by the app itself (Sources/PicasaViewer/AppIcon.swift).
+if "$APP/Contents/MacOS/PicasaNext" --write-icns "$APP/Contents/Resources/AppIcon.icns"; then
+  cp "$APP/Contents/Resources/AppIcon.icns" Resources/AppIcon.icns
+else
+  echo "[build] warning: app icon not generated"
+fi
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 if [ "${TESTS:-0}" = 1 ]; then

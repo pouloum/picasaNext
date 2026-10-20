@@ -4,10 +4,10 @@ import Foundation
 import ImageIO
 import Vision
 
-/// Face detection and name suggestion.
-/// Picasa's Neven engine is replaced by Apple Vision: faces are detected on a downscaled copy,
-/// each face crop gets a Vision feature print, and unnamed faces are matched to the people
-/// already named in Picasa (imported from .picasa.ini) by cosine similarity to per-person centroids.
+/// Face recognition helpers and name suggestion.
+/// Picasa's Neven engine is replaced by Apple Vision: faces are detected by `Analyzer` on a downscaled
+/// copy, each face crop gets a Vision feature print, and unnamed faces are matched to the people
+/// already named (in Picasa or here) by cosine similarity to per-person centroids.
 public struct FaceEngine: Sendable {
     public let library: Library
     public var concurrency: Int
@@ -23,40 +23,6 @@ public struct FaceEngine: Sendable {
     struct Detected: Sendable { var rect: NormalizedRect4; var confidence: Float; var print: [Float]? }
     /// x, y, w, h normalized, origin top-left.
     struct NormalizedRect4: Sendable { var x, y, w, h: Double }
-
-    public func detectPending(progress: ProgressHandler? = nil) async throws -> Int {
-        try await library.retryUnreadableFaces()
-        var done = 0
-        while true {
-            let work = try await library.pendingFaces(limit: 64)
-            if work.isEmpty { break }
-            let px = analysisPixels
-            let results = await parallelMap(work, concurrency: concurrency) { item in
-                (item, Self.analyse(url: item.url, known: item.known, maxPixel: px))
-            }
-            try await library.storeFaces(results.map { ($0.0.id, $0.0.known.map(\.id), $0.1) })
-            done += results.count
-            progress?(LibraryProgress(stage: "faces", done: done, total: nil, current: work.last?.url.path))
-        }
-        return done
-    }
-
-    /// Returns (prints for already-known faces, new detections not overlapping known ones). Nil if unreadable.
-    static func analyse(url: URL, known: [(id: Int64, rect: NormalizedRect4)], maxPixel: Int) -> (knownPrints: [[Float]?], detected: [Detected])? {
-        guard let image = ThumbnailStore.imageThumbnail(url, maxPixel: maxPixel) else { return nil }
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
-        let req = VNDetectFaceRectanglesRequest()
-        guard (try? handler.perform([req])) != nil else { return nil }
-        // Vision: origin bottom-left → convert to top-left.
-        let found = (req.results ?? []).map { o in
-            Detected(rect: .init(x: o.boundingBox.minX, y: 1 - o.boundingBox.maxY, w: o.boundingBox.width, h: o.boundingBox.height),
-                     confidence: o.confidence, print: nil)
-        }.filter { $0.rect.w * Double(image.width) >= 24 }
-        let knownPrints = known.map { featurePrint(image: image, rect: $0.rect) }
-        let fresh = found.filter { d in !known.contains { iou($0.rect, d.rect) > 0.3 } }
-            .map { var d = $0; d.print = featurePrint(image: image, rect: d.rect); return d }
-        return (knownPrints, fresh)
-    }
 
     static func iou(_ a: NormalizedRect4, _ b: NormalizedRect4) -> Double {
         let x1 = max(a.x, b.x), y1 = max(a.y, b.y), x2 = min(a.x + a.w, b.x + b.w), y2 = min(a.y + a.h, b.y + b.h)
@@ -91,6 +57,9 @@ public struct FaceEngine: Sendable {
         let (persons, centroids, dim) = try await library.personCentroids()
         guard !persons.isEmpty, dim > 0 else { return 0 }
         let threshold = suggestThreshold
+        // centroidsᵀ [dim × persons] for vDSP_mmul.
+        var centroidsT = [Float](repeating: 0, count: centroids.count)
+        vDSP_mtrans(centroids, 1, &centroidsT, 1, vDSP_Length(dim), vDSP_Length(persons.count))
         var made = 0
         var after: Int64 = 0
         while true {
@@ -101,8 +70,8 @@ public struct FaceEngine: Sendable {
             // scores[b × p] = prints[b × d] · centroidsᵀ[d × p]
             let flat = batch.flatMap(\.print)
             var scores = [Float](repeating: 0, count: batch.count * persons.count)
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int32(batch.count), Int32(persons.count), Int32(dim),
-                        1, flat, Int32(dim), centroids, Int32(dim), 0, &scores, Int32(persons.count))
+            vDSP_mmul(flat, 1, centroidsT, 1, &scores, 1,
+                      vDSP_Length(batch.count), vDSP_Length(persons.count), vDSP_Length(dim))
             var updates: [(Int64, Int64?)] = []
             for (i, f) in batch.enumerated() {
                 var best: Float = 0; var idx: vDSP_Length = 0
@@ -117,46 +86,59 @@ public struct FaceEngine: Sendable {
     }
 }
 
+/// A group of similar unnamed faces, to be named in one go (Picasa's "unnamed people").
+public struct FaceCluster: Sendable, Identifiable, Hashable {
+    public var id: Int64 { coverFaceId }
+    public let coverFaceId: Int64
+    public let faceIds: [Int64]
+}
+
 extension Library {
-    func pendingFaces(limit: Int) throws -> [(id: Int64, url: URL, known: [(id: Int64, rect: FaceEngine.NormalizedRect4)])] {
-        let items = try db.all("""
-            SELECT m.id, f.path || '/' || m.name FROM media m JOIN folders f ON f.id = m.folder_id
-            WHERE m.face_state = 0 LIMIT ?
-            """, [limit]) { ($0.int(0), URL(fileURLWithPath: $0.text(1))) }
-        return try items.map { item in
-            let known = try db.all("SELECT id, x, y, w, h FROM faces WHERE media_id = ? AND print IS NULL", [item.0]) {
-                ($0.int(0), FaceEngine.NormalizedRect4(x: $0.double(1), y: $0.double(2), w: $0.double(3), h: $0.double(4)))
-            }
-            return (item.0, item.1, known.map { (id: $0.0, rect: $0.1) })
+    /// Groups unnamed faces without a pending suggestion by feature-print similarity
+    /// (leader clustering: a face joins the first cluster whose leader is within `threshold`).
+    /// Largest faces first, at most `maxFaces` of them, so it stays interactive on huge libraries.
+    public func unnamedClusters(threshold: Float = 0.8, maxFaces: Int = 5_000) throws -> [FaceCluster] {
+        var faces: [(id: Int64, print: [Float])] = []
+        try db.query("""
+            SELECT id, print FROM faces WHERE person_id IS NULL AND suggested_person_id IS NULL AND print IS NOT NULL
+              AND media_id NOT IN (SELECT id FROM media WHERE ignored = 1)
+            ORDER BY w * h DESC LIMIT ?
+            """, [maxFaces]) { r in
+            if let d = r.blob(1) { faces.append((r.int(0), d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) })) }
         }
+        guard let dim = faces.first?.print.count, dim > 0 else { return [] }
+        var leaders: [[Float]] = []
+        var members: [[Int64]] = []
+        for f in faces where f.print.count == dim {
+            var best = -1, bestScore: Float = threshold
+            for (i, l) in leaders.enumerated() {
+                var s: Float = 0
+                vDSP_dotpr(f.print, 1, l, 1, &s, vDSP_Length(dim))
+                if s >= bestScore { best = i; bestScore = s }
+            }
+            if best >= 0 { members[best].append(f.id) } else { leaders.append(f.print); members.append([f.id]) }
+        }
+        return members.map { FaceCluster(coverFaceId: $0[0], faceIds: $0) }
+            .sorted { $0.faceIds.count > $1.faceIds.count }
     }
 
-    func storeFaces(_ results: [(mediaId: Int64, knownIds: [Int64], result: (knownPrints: [[Float]?], detected: [FaceEngine.Detected])?)]) throws {
-        func blob(_ v: [Float]?) -> Data? { v.map { $0.withUnsafeBufferPointer { Data(buffer: $0) } } }
-        try db.transaction {
-            for r in results {
-                guard let res = r.result else {
-                    let readable = FileManager.default.isReadableFile(atPath: try mediaPath(r.mediaId))
-                    try db.run("UPDATE media SET face_state = ? WHERE id = ?", readable ? 2 : 3, r.mediaId); continue
-                }
-                for (fid, p) in zip(r.knownIds, res.knownPrints) where p != nil {
-                    try db.run("UPDATE faces SET print = ? WHERE id = ?", blob(p), fid)
-                }
-                for d in res.detected {
-                    try db.run("INSERT INTO faces(media_id, x, y, w, h, source, confidence, print) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                               r.mediaId, d.rect.x, d.rect.y, d.rect.w, d.rect.h, FaceSource.vision.rawValue, Double(d.confidence), blob(d.print))
-                }
-                try db.run("UPDATE media SET face_state = 1 WHERE id = ?", r.mediaId)
+    /// Names several faces at once (user action → `manual`). Returns the person id.
+    @discardableResult
+    public func nameFaces(_ faceIds: [Int64], name: String) throws -> Int64? {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !faceIds.isEmpty else { return nil }
+        return try db.transaction {
+            var pid = try db.scalar("SELECT id FROM persons WHERE name = ? COLLATE NOCASE", [trimmed])
+            if pid == nil { pid = try db.run("INSERT INTO persons(name) VALUES(?)", trimmed) }
+            for f in faceIds {
+                try db.run("UPDATE faces SET person_id = ?, suggested_person_id = NULL, source = ? WHERE id = ?", pid!, FaceSource.manual.rawValue, f)
             }
+            return pid
         }
     }
 
     func mediaPath(_ id: Int64) throws -> String {
         try db.all("SELECT f.path || '/' || m.name FROM media m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?", [id]) { $0.text(0) }.first ?? ""
-    }
-
-    func retryUnreadableFaces() throws {
-        try db.run("UPDATE media SET face_state = 0 WHERE face_state = 3 AND kind != 1")
     }
 
     /// Normalized mean print per named person.

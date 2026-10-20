@@ -14,10 +14,14 @@ your photo folders.
 | Area | How |
 |---|---|
 | Indexing | Incremental scan of one or more roots: only directory listings + `stat`, so a rescan of 2 TB takes seconds-to-minutes. Added/changed/deleted files are detected by size + mtime. |
+| Exclusions | Folders named `thumbs`, `thumbnails`, `previews`, `cache`, `caches` are never scanned (Picasa skipped `thumbs` too). `scan --exclude NAME` or `--exclude /abs/path` is remembered; whatever was indexed under it is dropped from the library on the next scan (`excludes`, `unexclude` to manage). |
+| Small images | After metadata, images whose longest side is < 200 px, or < 512 px **without** camera EXIF (make/model, capture date, GPS), are set aside as probable thumbnails of other apps: no thumbnail, no analysis, hidden from views, listed under "Small images (ignored)". Small old camera/phone photos (with EXIF) are kept. `index --min-size N --thumb-size N` (0 disables a rule) re-evaluates without rescanning. |
 | Metadata | ImageIO / AVFoundation without decoding pixels: dimensions, EXIF date, GPS, camera, video duration. A "quick hash" (SHA-256 of size + first/last 64 KiB) for duplicate detection without reading 2 TB. |
 | Thumbnails | 320 px JPEG cache (`thumbs/ab/cd/<id>.jpg`), from embedded EXIF/RAW previews when present; first frame for videos. |
 | Picasa import | `.picasa.ini` (per folder, read during scan): stars, captions, faces + names (`[Contacts2]`), local albums (`[.album:…]`), keywords, rotation, `filters=` edit chain. `contacts.xml` (person names). Optional `db3` (`thumbindex.db`, `imagedata_*.pmp`, `albumdata_*.pmp`, `starlist.txt`): captions, faces/people, GPS, stars, thumbnails — paths are matched by trailing components + file size, so the library may have moved disks/OS. |
-| Faces | Apple Vision replaces Picasa's Neven engine: detection on a 1600 px copy, a Vision feature print per face, and name suggestions by cosine similarity to the people already named in Picasa. Rejected suggestions are remembered. |
+| Analysis | One Apple Vision pass per image on a single decoded 1600 px copy: faces (+ a print per face), scene labels (~1 300 classes, searchable), cats/dogs, a whole-image print, and on macOS 15+ an aesthetics score with a "utility" flag (screenshots, receipts, documents). |
+| Faces | Replaces Picasa's Neven engine: unnamed faces are grouped by similarity (name a whole group at once) and suggested names come from cosine similarity to the people already named. Rejected suggestions are remembered. |
+| Discover | **Best photos** (top 10 % aesthetics, documents excluded), **Similar & duplicates** (exact duplicates by quick hash anywhere + near-duplicates within a 10-minute window, best-looking first), **Animals**, **Screenshots & documents**. |
 | Viewer | SwiftUI app: All / Starred / Videos / People / Albums / Years / Folders, search (name, folder, caption, tag, person, album, camera), virtualized grid (NSCollectionView), viewer with face boxes (click to name), video playback, info panel, star toggle. |
 
 Edits made in PicasaNext (stars, names, captions) live in the library database only.
@@ -39,10 +43,10 @@ CLI (recommended for the first 2 TB pass, it can run unattended):
 
 ```bash
 cli=.build/release/picasa-cli
-$cli scan /Volumes/Photos              # index files, read .picasa.ini
+$cli scan /Volumes/Photos --exclude "LightCraft Library"   # index files, read .picasa.ini
 $cli import-contacts /path/Picasa2/contacts/contacts.xml   # optional
 $cli index                             # metadata + thumbnails
-$cli faces                             # Vision detection + name suggestions
+$cli analyze                           # Vision pass: faces, labels, animals, aesthetics, similar photos
 $cli stats
 $cli import-db3 /path/Picasa2/db3      # optional, if you have it (--no-thumbs to skip its thumbnails)
 ```
@@ -53,6 +57,10 @@ SSD/NAS). Every stage is resumable: stop it any time and rerun, only pending ite
 
 GUI: run `.build/release/PicasaNext` (or open `build/release/PicasaNext.app`), **File ▸ Add Folder to
 Library…** (⌘O), optionally **File ▸ Import Picasa Data…** (contacts and/or db3).
+
+Near-duplicate threshold: `$cli similar --threshold 0.95` (cosine of Vision image prints). Calibrate it
+on your own photos with `swift Tools/calibrate-similar.swift list.txt` (one image path per line): pick a
+value between the "different photos max" and the "same photo min" it prints.
 
 ## Sizing for 2 TB
 

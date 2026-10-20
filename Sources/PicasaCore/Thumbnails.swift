@@ -45,17 +45,25 @@ public final class ThumbnailStore: Sendable {
         return write(image, to: url(id: id)) ? .done : .unreadable
     }
 
-    /// ImageIO thumbnail: uses the embedded EXIF/RAW preview when it is large enough,
-    /// otherwise decodes with subsampling. Orientation is applied.
+    /// Downscaled image (longest side ≤ maxPixel), orientation applied.
+    /// The embedded EXIF/RAW preview is used only when it is large enough: JPEGs often embed a
+    /// 160 px thumbnail, which ImageIO would otherwise return as-is for any requested size.
     public static func imageThumbnail(_ url: URL, maxPixel: Int) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
-        let opts: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-            kCGImageSourceShouldCacheImmediately: false,
-        ]
-        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        let full = max(props?[kCGImagePropertyPixelWidth] as? Int ?? 0, props?[kCGImagePropertyPixelHeight] as? Int ?? 0)
+        let target = full > 0 ? min(maxPixel, full) : maxPixel
+        func make(always: Bool) -> CGImage? {
+            let opts: [CFString: Any] = [
+                always ? kCGImageSourceCreateThumbnailFromImageAlways : kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                kCGImageSourceShouldCacheImmediately: false,
+            ]
+            return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+        }
+        if let embedded = make(always: false), max(embedded.width, embedded.height) * 10 >= target * 9 { return embedded }
+        return make(always: true) ?? make(always: false)
     }
 
     public static func videoThumbnail(_ url: URL, maxPixel: Int) async -> CGImage? {

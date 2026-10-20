@@ -13,6 +13,9 @@ public struct MediaMetadata: Sendable {
     public var camera: String?
     public var duration: Double?
     public var quickHash: String?
+    /// The file carries camera metadata (make/model, capture date or GPS). Thumbnails written by
+    /// other applications usually don't, which is how they are told apart from small old photos.
+    public var exif = false
 }
 
 public enum MetadataReader {
@@ -68,6 +71,7 @@ public enum MetadataReader {
             ?? (exif?[kCGImagePropertyExifDateTimeDigitized] as? String)
             ?? (tiff?[kCGImagePropertyTIFFDateTime] as? String)
         if let d = dateStr { m.takenAt = exifDate.date(from: d) }
+        m.exif = dateStr != nil || tiff?[kCGImagePropertyTIFFModel] != nil || props[kCGImagePropertyGPSDictionary] != nil
         let make = (tiff?[kCGImagePropertyTIFFMake] as? String)?.trimmingCharacters(in: .whitespaces)
         let model = (tiff?[kCGImagePropertyTIFFModel] as? String)?.trimmingCharacters(in: .whitespaces)
         if let model { m.camera = (make.map { model.hasPrefix($0) ? model : "\($0) \(model)" } ?? model) }
@@ -81,6 +85,7 @@ public enum MetadataReader {
 
     static func video(_ url: URL) async -> MediaMetadata {
         var m = MediaMetadata()
+        m.exif = true // videos are never treated as thumbnails
         let asset = AVURLAsset(url: url)
         if let d = try? await asset.load(.duration), d.isNumeric { m.duration = d.seconds }
         if let track = try? await asset.loadTracks(withMediaType: .video).first,
@@ -117,7 +122,7 @@ extension Library {
     func pending(stateColumn: String, limit: Int) throws -> [(id: Int64, url: URL, kind: MediaKind)] {
         try db.all("""
             SELECT m.id, f.path || '/' || m.name, m.kind FROM media m JOIN folders f ON f.id = m.folder_id
-            WHERE m.\(stateColumn) = 0 LIMIT ?
+            WHERE m.\(stateColumn) = 0 AND m.ignored = 0 LIMIT ?
             """, [limit]) { ($0.int(0), URL(fileURLWithPath: $0.text(1)), MediaKind(rawValue: Int($0.int(2))) ?? .image) }
     }
 
@@ -127,9 +132,9 @@ extension Library {
                 guard let m else { try db.run("UPDATE media SET meta_state = 3 WHERE id = ?", id); continue }
                 try db.run("""
                     UPDATE media SET width=?, height=?, orientation=?, taken_at=coalesce(?, taken_at), lat=coalesce(?, lat),
-                    lon=coalesce(?, lon), camera=?, duration=?, quick_hash=?, meta_state=1 WHERE id=?
+                    lon=coalesce(?, lon), camera=?, duration=?, quick_hash=?, exif=?, meta_state=1 WHERE id=?
                     """, m.width, m.height, m.orientation, m.takenAt?.timeIntervalSince1970, m.lat, m.lon,
-                           m.camera, m.duration, m.quickHash, id)
+                           m.camera, m.duration, m.quickHash, m.exif, id)
             }
         }
     }
@@ -140,9 +145,40 @@ extension Library {
         }
     }
 
+    /// Marks every thumbnail for regeneration (files are overwritten in place as they are redone).
+    public func resetThumbnails() throws -> Int {
+        try db.run("UPDATE media SET thumb_state = 0 WHERE thumb_state != 0")
+        return db.changes
+    }
+
+    /// Redo face detection everywhere: drops unnamed Vision faces and all prints, keeps named faces
+    /// and Picasa/manual rectangles (their prints are recomputed).
+    public func resetFaces() throws -> Int {
+        try db.transaction {
+            try db.run("DELETE FROM faces WHERE source = ? AND person_id IS NULL", FaceSource.vision.rawValue)
+            try db.run("UPDATE faces SET print = NULL, suggested_person_id = NULL")
+            try db.run("UPDATE media SET face_state = 0 WHERE kind != 1")
+            return db.changes
+        }
+    }
+
     /// Items skipped because they were unreadable get another chance on each run.
     func retryUnreadable(_ column: String) throws {
         try db.run("UPDATE media SET \(column) = 0 WHERE \(column) = 3")
+    }
+
+    /// Flags small images as ignored (no thumbnail, no analysis, hidden from views, kept in the index):
+    /// longest side < `minSize`, or < `thumbSize` without camera metadata (typical of thumbnails
+    /// written by other apps; small old camera/phone photos have EXIF and are kept). 0 disables a rule.
+    /// Re-evaluated on every run, so changing the thresholds takes effect without rescanning.
+    public func classifySmall(minSize: Int, thumbSize: Int) throws -> Int {
+        try db.run("""
+            UPDATE media SET ignored = CASE
+              WHEN kind = 0 AND width IS NOT NULL AND height IS NOT NULL
+               AND (max(width, height) < ? OR (max(width, height) < ? AND exif = 0)) THEN 1 ELSE 0 END
+            WHERE meta_state IN (1, 2)
+            """, minSize, thumbSize)
+        return Int(try db.scalar("SELECT count(*) FROM media WHERE ignored = 1") ?? 0)
     }
 
     /// Files whose date could not be read fall back to their modification time.
@@ -156,6 +192,9 @@ public struct Indexer: Sendable {
     public let library: Library
     public var concurrency: Int
     public var batch = 256
+    /// See `Library.classifySmall`.
+    public var minSize = 200
+    public var thumbSize = 512
 
     public init(library: Library, concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
         self.library = library
@@ -176,6 +215,7 @@ public struct Indexer: Sendable {
             progress?(LibraryProgress(stage: "metadata", done: done, total: nil, current: work.last?.url.path))
         }
         try await library.fillMissingDates()
+        _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize)
         return done
     }
 

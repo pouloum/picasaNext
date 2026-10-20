@@ -112,10 +112,10 @@ defer { try? FileManager.default.removeItem(at: tmp) }
 do {
     let media = tmp.appendingPathComponent("media/2010")
     try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
-    // 64×48 JPEG generated with CoreGraphics.
-    let ctx = CGContext(data: nil, width: 64, height: 48, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+    // 640×480 (large enough not to be ignored as a thumbnail) JPEG generated with CoreGraphics.
+    let ctx = CGContext(data: nil, width: 640, height: 480, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
                         bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
-    ctx.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: 64, height: 48))
+    ctx.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 480))
     let dest = CGImageDestinationCreateWithURL(media.appendingPathComponent("IMG_0001.JPG") as CFURL, "public.jpeg" as CFString, 1, nil)!
     CGImageDestinationAddImage(dest, ctx.makeImage()!, nil); CGImageDestinationFinalize(dest)
     try "[IMG_0001.JPG]\nstar=yes\nfaces=rect64(3f845bcb59418507),d5a3ba4f3c09a5c1\n[Contacts2]\nd5a3ba4f3c09a5c1=Jane;;\n"
@@ -133,7 +133,7 @@ do {
     let ids = try await lib.mediaIds(.search("jane"))
     check(ids.count == 1, "search by person name")
     let item = try await lib.items(ids: ids).first
-    check(item?.width == 64 && item?.height == 48, "metadata dims")
+    check(item?.width == 640 && item?.height == 480, "metadata dims")
     check(lib.thumbs.exists(id: ids[0]), "thumbnail written")
 
     // Synthetic db3 written on "Windows": one folder, the image, one virtual face entry for person row 1.
@@ -154,6 +154,160 @@ do {
     check(bob == ids, "db3 person searchable")
     let caption = try await lib.items(ids: ids).first?.caption
     check(caption == "Rouge", "db3 caption")
+
+    // Name suggestions: two named persons with synthetic prints, one unnamed face close to Bob.
+    func blob(_ v: [Float]) -> Data { v.withUnsafeBufferPointer { Data(buffer: $0) } }
+    let mid = ids[0]
+    let (bobId, janeId) = try await lib.withDB { db in
+        (try db.scalar("SELECT id FROM persons WHERE name = 'Bob'")!, try db.scalar("SELECT id FROM persons WHERE name = 'Jane'")!)
+    }
+    let (pBob, pJane, pNear) = (blob([1, 0, 0]), blob([0, 1, 0]), blob([0.95, 0.31, 0]))
+    let unnamed = try await lib.withDB { db -> Int64 in
+        try db.run("INSERT INTO faces(media_id,x,y,w,h,person_id,source,print) VALUES(?,0,0,.1,.1,?,1,?)", mid, bobId, pBob)
+        try db.run("INSERT INTO faces(media_id,x,y,w,h,person_id,source,print) VALUES(?,0,0,.1,.1,?,1,?)", mid, janeId, pJane)
+        return try db.run("INSERT INTO faces(media_id,x,y,w,h,source,print) VALUES(?,.5,.5,.1,.1,1,?)", mid, pNear)
+    }
+    let made = try await FaceEngine(library: lib).suggestNames()
+    let suggested = try await lib.withDB { try $0.scalar("SELECT suggested_person_id FROM faces WHERE id = ?", [unnamed]) }
+    check(made == 1 && suggested == bobId, "suggestion goes to nearest person (made \(made), got \(String(describing: suggested)))")
+    try await lib.rejectSuggestion(faceId: unnamed)
+    _ = try await FaceEngine(library: lib).suggestNames()
+    let again = try await lib.withDB { try $0.scalar("SELECT suggested_person_id FROM faces WHERE id = ?", [unnamed]) }
+    check(again == nil, "rejected suggestion is not proposed again")
+
+    // A JPEG with a small embedded EXIF thumbnail must still give a full-size preview.
+    let big = tmp.appendingPathComponent("big.jpg")
+    let bctx = CGContext(data: nil, width: 2400, height: 1600, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                         bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+    bctx.setFillColor(CGColor(red: 0, green: 0, blue: 1, alpha: 1)); bctx.fill(CGRect(x: 0, y: 0, width: 2400, height: 1600))
+    let bdest = CGImageDestinationCreateWithURL(big as CFURL, "public.jpeg" as CFString, 1, nil)!
+    CGImageDestinationAddImage(bdest, bctx.makeImage()!, [kCGImageDestinationEmbedThumbnail: true] as CFDictionary)
+    CGImageDestinationFinalize(bdest)
+    let preview = ThumbnailStore.imageThumbnail(big, maxPixel: 1600)
+    check(preview?.width == 1600 && preview?.height == 1067, "preview is decoded at requested size, not the embedded thumbnail (\(preview?.width ?? 0)×\(preview?.height ?? 0))")
+    let small = ThumbnailStore.imageThumbnail(big, maxPixel: 4000)
+    check(small?.width == 2400, "preview never upscales beyond the original")
+
+    // Clustering unnamed faces, then naming a whole cluster.
+    let (c1, c2, c3) = (blob([0, 0, 1]), blob([0, 0.1, 0.995]), blob([0.7, 0.7, 0.14]))
+    let clusterFaces = try await lib.withDB { db -> [Int64] in
+        [try db.run("INSERT INTO faces(media_id,x,y,w,h,source,print) VALUES(?,.1,.1,.3,.3,1,?)", mid, c1),
+         try db.run("INSERT INTO faces(media_id,x,y,w,h,source,print) VALUES(?,.2,.2,.2,.2,1,?)", mid, c2),
+         try db.run("INSERT INTO faces(media_id,x,y,w,h,source,print) VALUES(?,.3,.3,.1,.1,1,?)", mid, c3)]
+    }
+    let clusters = try await lib.unnamedClusters()
+    let grouped = clusters.first { $0.faceIds.contains(clusterFaces[0]) }
+    check(grouped?.faceIds.sorted() == [clusterFaces[0], clusterFaces[1]].sorted(), "similar faces grouped, different one apart: \(clusters.map(\.faceIds))")
+    let carol = try await lib.nameFaces(grouped?.faceIds ?? [], name: "Carol")
+    let carolFaces = try await lib.withDB { try $0.scalar("SELECT count(*) FROM faces WHERE person_id = ?", [carol!]) }
+    check(carolFaces == 2, "naming a cluster names all its faces")
+
+    // Similar groups + Discover filters on synthetic analysis results.
+    let (pA, pB, pC) = (blob([1, 0, 0]), blob([0.99, 0.141, 0]), blob([0, 1, 0]))
+    let synth = try await lib.withDB { db -> [Int64] in
+        let folder = try db.scalar("SELECT folder_id FROM media LIMIT 1")!
+        func add(_ name: String, _ t: Double, _ p: Data?, hash: String? = nil, aesthetic: Double? = nil, utility: Bool = false) throws -> Int64 {
+            try db.run("""
+                INSERT INTO media(folder_id, name, kind, size, mtime, taken_at, print, quick_hash, aesthetic, utility, meta_state, thumb_state, face_state, analysis_state)
+                VALUES(?, ?, 0, 1000, 0, ?, ?, ?, ?, ?, 1, 1, 1, 1)
+                """, folder, name, t, p, hash, aesthetic, utility)
+        }
+        return [try add("burst1.jpg", 1000, pA, aesthetic: 0.9),           // near-dup of burst2 (60 s apart)
+                try add("burst2.jpg", 1060, pB, aesthetic: 0.2),
+                try add("other.jpg", 1100, pC, aesthetic: 0.1),            // same window, different picture
+                try add("copy1.jpg", 5_000_000, pC, hash: "h1"),           // exact duplicates far apart in time
+                try add("copy2.jpg", 9_000_000, nil, hash: "h1"),
+                try add("receipt.jpg", 2000, pC, aesthetic: 0.95, utility: true)]
+    }
+    try await lib.withDB { db in
+        try db.run("INSERT INTO animals(media_id, species, confidence, x, y, w, h) VALUES(?, 'cat', 0.9, 0, 0, .5, .5)", synth[2])
+        try db.run("INSERT INTO labels(media_id, label, confidence) VALUES(?, 'beach', 0.8)", synth[0])
+    }
+    let sim = try await lib.groupSimilar()
+    check(sim.groups == 2 && sim.exactDuplicates == 2, "similar groups: \(sim)")
+    let simIds = try await lib.mediaIds(.similar)
+    check(Set(simIds) == Set([synth[0], synth[1], synth[3], synth[4]]), "similar filter: \(simIds)")
+    let group = try await lib.similarGroup(of: synth[0])
+    check(group.first == synth[0], "best-looking photo first in its group")
+    let best = try await lib.mediaIds(.best)
+    check(best.contains(synth[0]) && !best.contains(synth[5]), "best excludes documents: \(best)")
+    let util = try await lib.mediaIds(.utility), pets = try await lib.mediaIds(.animals)
+    check(util == [synth[5]], "utility filter")
+    check(pets == [synth[2]], "animals filter")
+    let (cat, beach) = (try await lib.mediaIds(.search("cat")), try await lib.mediaIds(.search("beach")))
+    check(cat == [synth[2]] && beach == [synth[0]], "search finds animals and labels")
+    // Labels, suggestions and multi-term search (synth[0] = beach + trip, synth[1] = trip).
+    try await lib.withDB { db in
+        try db.run("INSERT INTO tags(media_id, tag) VALUES(?, 'trip'), (?, 'trip')", synth[0], synth[1])
+        try db.run("INSERT INTO labels(media_id, label, confidence) VALUES(?, 'musical_instrument', 0.9)", synth[1])
+    }
+    let summaries = try await lib.labelSummaries()
+    let trip = summaries.first { $0.label == "trip" }
+    check(trip?.count == 2 && trip?.coverMediaId == synth[0], "label card: count and best-looking cover (\(String(describing: trip)))")
+    check(summaries.first { $0.label == "musical_instrument" }?.title == "Musical instrument", "label display name")
+    let sugg = try await lib.suggestions(for: "musical inst")
+    check(sugg.contains(.label("musical_instrument")), "suggestions match labels with spaces: \(sugg)")
+    let janeSugg = try await lib.suggestions(for: "jan")
+    check(janeSugg.contains { if case .person(_, "Jane") = $0 { true } else { false } }, "suggestions include people: \(janeSugg)")
+    let both = try await lib.mediaIds(.query([.label("trip"), .label("beach")], ""))
+    check(both == [synth[0]], "tokens are combined with AND: \(both)")
+    let withText = try await lib.mediaIds(.query([.label("trip")], "burst2"))
+    check(withText == [synth[1]], "token + free text: \(withText)")
+    let vocab = try await lib.searchVocabulary()
+    check(vocab.contains(.label("trip")) && vocab.contains(.label("musical_instrument"))
+          && vocab.contains { if case .person(_, "Jane") = $0 { true } else { false } }, "search vocabulary: \(vocab.prefix(8))")
+    let words = try await lib.mediaIds(.query([], "burst beach"))
+    check(words == [synth[0]], "every free-text word must match: \(words)")
+
+    try await lib.withDB { db in for id in synth { try db.run("DELETE FROM media WHERE id = ?", id) } }
+
+    // A series shot in sequence: each photo ≈ the previous one (cos ≈ 0.99), first vs last far apart.
+    // It must not chain into a single group.
+    let chain = (0..<12).map { i -> Data in let a = Float(i) * 0.14; return blob([cos(a), sin(a), 0]) }
+    let chainIds = try await lib.withDB { db -> [Int64] in
+        let folder = try db.scalar("SELECT folder_id FROM media LIMIT 1")!
+        return try chain.enumerated().map { i, p in
+            try db.run("""
+                INSERT INTO media(folder_id, name, kind, size, mtime, taken_at, print, meta_state, thumb_state, face_state, analysis_state)
+                VALUES(?, ?, 0, 1000, 0, ?, ?, 1, 1, 1, 1)
+                """, folder, "series_\(i).jpg", 20_000 + Double(i) * 5, p)
+        }
+    }
+    _ = try await lib.groupSimilar()
+    let biggest = try await lib.withDB { db in
+        try db.scalar("SELECT max(n) FROM (SELECT count(*) n FROM similar WHERE media_id IN (\(chainIds.map(String.init).joined(separator: ","))) GROUP BY group_id)") ?? 0
+    }
+    check(biggest > 0 && biggest <= 4, "a sequential series is split into small groups, not chained (largest \(biggest))")
+    try await lib.withDB { db in for id in chainIds { try db.run("DELETE FROM media WHERE id = ?", id) } }
+
+    // Bursts: 4 shots ≤ 2 s apart (same camera/folder, identical prints) → one burst, not a "similar" group.
+    // A 5th shot 30 s later and a photo without EXIF are not part of it.
+    let same = blob([0, 0, 1])
+    let burstIds = try await lib.withDB { db -> [Int64] in
+        let folder = try db.scalar("SELECT folder_id FROM media LIMIT 1")!
+        func add(_ n: String, _ t: Double, exif: Bool = true) throws -> Int64 {
+            try db.run("""
+                INSERT INTO media(folder_id, name, kind, size, mtime, taken_at, print, camera, exif, meta_state, thumb_state, face_state, analysis_state)
+                VALUES(?, ?, 0, 1000, 0, ?, ?, 'Canon EOS', ?, 1, 1, 1, 1)
+                """, folder, n, t, same, exif)
+        }
+        return [try add("b1.jpg", 50_000), try add("b2.jpg", 50_000.5), try add("b3.jpg", 50_002), try add("b4.jpg", 50_003),
+                try add("later.jpg", 50_033), try add("noexif.jpg", 50_001, exif: false)]
+    }
+    let rb = try await lib.groupSimilar()
+    let burstList = try await lib.mediaIds(.bursts)
+    check(rb.bursts == 1 && burstList == Array(burstIds.prefix(4)), "burst detected in shooting order: \(rb) \(burstList)")
+    let simAfter = try await lib.mediaIds(.similar)
+    check(!burstIds.prefix(4).contains { simAfter.contains($0) } && simAfter.contains(burstIds[4]) && simAfter.contains(burstIds[5]),
+          "burst shots stay out of near-duplicates; the other two look-alikes are grouped: \(simAfter)")
+    try await lib.withDB { db in for id in burstIds { try db.run("DELETE FROM media WHERE id = ?", id) } }
+
+    // Threshold is remembered.
+    let t0 = try await lib.similarThreshold()
+    try await lib.setSimilarThreshold(0.93)
+    let t1 = try await lib.similarThreshold()
+    let rt = try await lib.groupSimilar()
+    check(t0 == 0.97 && t1 == 0.93 && rt.threshold == 0.93, "similarity threshold persisted (\(t0) → \(t1), used \(rt.threshold))")
 
     // Accented name stored NFD on disk, NFC in .picasa.ini.
     let nfd = "e\u{301}te\u{301}.jpg"
@@ -180,6 +334,49 @@ do {
     let r3 = try await Scanner(library: lib).scan(root: tmp.appendingPathComponent("media"))
     check(r3.removed == 2, "deleted files pruned: \(r3)")
 } catch { check(false, "library e2e threw \(error)") }
+
+// MARK: Folder exclusions and small images
+do {
+    let root = tmp.appendingPathComponent("excl")
+    func jpeg(_ rel: String, _ w: Int, _ h: Int, camera: String? = nil) throws {
+        let url = root.appendingPathComponent(rel)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let c = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        c.setFillColor(CGColor(red: 0, green: 1, blue: 0, alpha: 1)); c.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        let d = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil)!
+        let props: [CFString: Any] = camera.map { [kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFModel: $0]] } ?? [:]
+        CGImageDestinationAddImage(d, c.makeImage()!, props as CFDictionary); CGImageDestinationFinalize(d)
+    }
+    try jpeg("2004/photo_big.jpg", 2000, 1500)                    // kept
+    try jpeg("2004/old_phone.jpg", 320, 240, camera: "Nokia 6600") // small but has camera EXIF → kept
+    try jpeg("2004/tiny.jpg", 150, 100, camera: "Nokia 6600")      // below min size → ignored
+    try jpeg("2004/app_thumb.jpg", 400, 300)                      // small, no EXIF → ignored
+    try jpeg("2004/thumbs/t1.jpg", 2000, 1500)                    // default-excluded folder
+    try jpeg("LightCraft Library/a/b.jpg", 2000, 1500)            // excluded later by the user
+
+    let lib = try Library(root: tmp.appendingPathComponent("libexcl"))
+    let r1 = try await Scanner(library: lib).scan(root: root)
+    check(r1.added == 5, "thumbs/ skipped by default: \(r1)")
+    try await lib.addExclude("lightcraft library")
+    let r2 = try await Scanner(library: lib).scan(root: root)
+    check(r2.removed == 1, "user exclusion prunes what was indexed under it: \(r2)")
+    _ = try await Indexer(library: lib).extractMetadata()
+    let ignored = try await lib.items(ids: try await lib.mediaIds(.ignored)).map(\.name).sorted()
+    check(ignored == ["app_thumb.jpg", "tiny.jpg"], "small images without camera EXIF ignored: \(ignored)")
+    let visible = try await lib.items(ids: try await lib.mediaIds(.all)).map(\.name).sorted()
+    check(visible == ["old_phone.jpg", "photo_big.jpg"], "ignored images hidden from All: \(visible)")
+    let thumbs = try await Indexer(library: lib).generateThumbnails()
+    check(thumbs == 2, "no thumbnails for ignored images (\(thumbs))")
+    let relaxed = try await lib.classifySmall(minSize: 0, thumbSize: 0)
+    check(relaxed == 0, "thresholds re-evaluated without rescanning")
+    let bogus = (try? await Scanner(library: lib).scan(root: URL(fileURLWithPath: "/no/such/folder"))) == nil
+    let knownRoots = try await lib.roots().map(\.path)
+    check(bogus && !knownRoots.contains("/no/such/folder"), "a missing folder is not remembered as a root")
+    let dropped = try await lib.removeRoot(root.path)
+    let left = try await lib.stats().images
+    check(dropped == 4 && left == 0, "remove-root drops its index (\(dropped), \(left) left)")
+} catch { check(false, "exclusions threw \(error)") }
 
 print("\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)
