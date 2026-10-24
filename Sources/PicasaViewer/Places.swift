@@ -19,6 +19,13 @@ struct PlacesView: View {
     /// Map style: standard, satellite imagery, or hybrid (imagery + roads and names); optional relief.
     @AppStorage("places.style") private var style = "standard"
     @AppStorage("places.relief") private var relief = false
+    @State private var year = 0 // 0 = all years
+    /// The camera was put on a place by a link: the first load must not fit everything instead.
+    @State private var centred = false
+    @State private var geoCells = (named: 0, unnamed: 0)
+
+    var years: [Int] { Array(Set(points.map(\.year).filter { $0 > 0 })).sorted(by: >) }
+    var shownPoints: [GeoPoint] { year == 0 ? points : points.filter { $0.year == year } }
 
     /// Side panel cap: enough to browse, small enough to stay instant on huge regions.
     private let panelLimit = 5000
@@ -79,13 +86,30 @@ struct PlacesView: View {
                 }
             }
         }
+        .onChange(of: model.openPlace) { centre(on: model.openPlace) }
         .task(id: model.revision) {
             let first = !loaded
             points = (try? await model.library.geoPoints()) ?? []
+            geoCells = (try? await model.library.geoCellCounts()) ?? (0, 0)
             loaded = true
-            // Live updates (scan running) re-cluster in place; only the first load moves the camera.
-            if first || region == nil { fitAll() } else { recluster() }
+            // Live updates (scan running) re-cluster in place; only the first load moves the camera —
+            // unless a link asked for a place (then the camera is already there: keep it).
+            if let p = model.openPlace { centre(on: p) }
+            else if centred { recluster() }
+            else if first || region == nil { fitAll() } else { recluster() }
         }
+    }
+
+    /// A link (info panel) asked for a place: zoom there (about 2 km across).
+    func centre(on p: GeoPoint?) {
+        guard let p else { return }
+        model.openPlace = nil
+        centred = true
+        // Close in: about 250 m across, the photo's pin in the middle.
+        let c = CLLocationCoordinate2D(latitude: p.lat, longitude: p.lon)
+        position = .camera(MapCamera(centerCoordinate: c, distance: 350))
+        region = MKCoordinateRegion(center: c, span: MKCoordinateSpan(latitudeDelta: 0.0025, longitudeDelta: 0.0025))
+        recluster()
     }
 
     /// Initial camera: the box around every geotagged photo.
@@ -116,6 +140,17 @@ struct PlacesView: View {
 
     var stylePicker: some View {
         HStack(spacing: 8) {
+            Picker("", selection: $year) {
+                Text("All years").tag(0)
+                Divider()
+                ForEach(years, id: \.self) { Text(String($0)).tag($0) }
+            }
+            .labelsHidden().fixedSize()
+            .onChange(of: year) { selected = nil; recluster() }
+            if geoCells.unnamed > 0 && model.job == nil {
+                Button { model.geocode() } label: { Label("Name places", systemImage: "mappin.and.ellipse") }
+                    .help("Look up the town of \(geoCells.unnamed) areas with photos (Apple's geocoder, network needed; slow, resumable)")
+            }
             Picker("", selection: $style) {
                 Text("Map").tag("standard")
                 Text("Satellite").tag("satellite")
@@ -150,7 +185,7 @@ struct PlacesView: View {
         guard let r = region else { return }
         let lat = (r.center.latitude - r.span.latitudeDelta / 2)...(r.center.latitude + r.span.latitudeDelta / 2)
         let lon = (r.center.longitude - r.span.longitudeDelta / 2)...(r.center.longitude + r.span.longitudeDelta / 2)
-        let pts = points, limit = panelLimit
+        let pts = shownPoints, limit = panelLimit
         clusterTask?.cancel()
         clusterTask = Task {
             let (c, inView) = await Task.detached(priority: .userInitiated) { () -> ([GeoCluster], [Int64]) in

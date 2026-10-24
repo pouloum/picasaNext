@@ -43,6 +43,9 @@ commands:
                           people (pets) with the same name (case, accents, spaces ignored), e.g. one
                           person imported from several Picasa contacts: listed, merged with --apply
                           into the one with the most photos
+  geocode [--limit N]     name the places of geotagged photos (town, region, country) with Apple's
+                          geocoder: network needed, one request per ~2 km area, throttled by Apple
+                          (slow, resumable; names become searchable and show in the viewer)
   suggest                 recompute name suggestions for faces and animals (no file is read)
   stats                   library summary
   similar [--threshold T] rebuild bursts and similar/duplicate groups (T: cosine, saved; default 0.97)
@@ -84,7 +87,7 @@ func split(_ a: [String], options: Set<String>) -> (positional: [String], values
     }
     return (pos, vals)
 }
-let parsed = split(rest, options: ["--exclude", "--min-size", "--thumb-size", "--threshold", "--batch"])
+let parsed = split(rest, options: ["--exclude", "--min-size", "--thumb-size", "--threshold", "--batch", "--limit"])
 
 /// One-line, rate-limited progress on stderr.
 final class Ticker: @unchecked Sendable {
@@ -196,6 +199,7 @@ final class Ticker: @unchecked Sendable {
         let r = try await library.importDB3(at: URL(fileURLWithPath: (d as NSString).expandingTildeInPath),
                                             reuseThumbnails: !rest.contains("--no-thumbs")) { tick($0) }
         tick.end(); print("db3: \(r)")
+        try await library.mirrorToCopies(.face) // names imported on hidden copies go to the photo kept
     case "export", "export-ini":
         var format = "picasa"
         var dry = false, only: String?
@@ -219,6 +223,10 @@ final class Ticker: @unchecked Sendable {
             tick.end(); print(r)
             for f in r.failed { print("  failed: \(f.path): \(f.error)") }
         }
+    case "geocode":
+        let n = parsed.values["--limit"]?.last.flatMap(Int.init) ?? .max
+        let r = try await Geocoder(library: library).run(limit: n) { tick($0) }
+        tick.end(); print(r)
     case "suggest":
         let f = try await FaceEngine(library: library).suggestNames()
         let p = try await IdentityEngine.suggest(library: library, kind: .pet, threshold: 0.82)

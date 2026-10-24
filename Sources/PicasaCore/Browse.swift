@@ -97,8 +97,10 @@ public struct GeoPoint: Sendable, Hashable {
     public let lon: Double
     /// Used to pick a cluster's cover (best-looking photo).
     public let score: Double
-    public init(id: Int64, lat: Double, lon: Double, score: Double) {
-        self.id = id; self.lat = lat; self.lon = lon; self.score = score
+    /// Year taken (0 = unknown), for the map's year filter.
+    public var year = 0
+    public init(id: Int64, lat: Double, lon: Double, score: Double, year: Int = 0) {
+        self.id = id; self.lat = lat; self.lon = lon; self.score = score; self.year = year
     }
 }
 
@@ -230,6 +232,9 @@ extension Library {
                 let (c, a) = textClause(String(word)); parts.append(c); args += a
             }
             return (parts.isEmpty ? "1" : parts.joined(separator: " AND "), args)
+        case .year(0):
+            // No date: none at all, or one in the future (a camera clock never set).
+            return ("(m.taken_at IS NULL OR m.taken_at > ?)", [Date().timeIntervalSince1970 + 2 * 86400])
         case let .year(y):
             let (start, end) = Self.yearRange(y)
             return ("m.taken_at >= ? AND m.taken_at < ?", [start, end])
@@ -259,9 +264,11 @@ extension Library {
              OR m.id IN (SELECT media_id FROM animals WHERE species LIKE ?)
              OR m.id IN (SELECT a.media_id FROM animals a JOIN pets p ON p.id = a.pet_id WHERE p.name LIKE ?)
              OR m.id IN (SELECT fa.media_id FROM faces fa JOIN persons p ON p.id = fa.person_id WHERE p.name LIKE ?)
-             OR m.id IN (SELECT ai.media_id FROM album_items ai JOIN albums a ON a.id = ai.album_id WHERE a.name LIKE ?))
+             OR m.id IN (SELECT ai.media_id FROM album_items ai JOIN albums a ON a.id = ai.album_id WHERE a.name LIKE ?)
+             OR (m.lat IS NOT NULL AND printf('%.2f:%.2f', round(m.lat * 50) / 50.0, round(m.lon * 50) / 50.0) IN
+                 (SELECT cell FROM geo_names WHERE locality LIKE ? OR area LIKE ? OR country LIKE ?)))
             """
-        return (clause, Array(repeating: like, count: 10))
+        return (clause, Array(repeating: like, count: 13))
     }
 
     /// Every label and keyword with its photo count and the best-looking photo as cover, most used first.
@@ -323,7 +330,9 @@ extension Library {
     public func mediaIdsAndYears(_ filter: MediaFilter) throws -> [(id: Int64, year: Int)] {
         var (w, args) = whereClause(filter)
         let row: (Database.Row) -> (id: Int64, year: Int) = { ($0.int(0), Int($0.int(1))) }
-        let year = "coalesce(CAST(strftime('%Y', m.taken_at, 'unixepoch', 'localtime') AS INTEGER), 0)"
+        // Dates in the future (a camera clock never set: 2037…) count as no date: section "No date", at the end.
+        let future = Int(Date().timeIntervalSince1970) + 2 * 86400
+        let year = "CASE WHEN m.taken_at IS NULL OR m.taken_at > \(future) THEN 0 ELSE CAST(strftime('%Y', m.taken_at, 'unixepoch', 'localtime') AS INTEGER) END"
         if case .folder = filter {} else { w = "(\(w)) AND m.hidden = 0" } // Picasa-hidden photos only show in their folder
         // Only indexed items (metadata read and thumbnail made): the rest appear as the indexer gets to them.
         if case .ignored = filter {} else { w = "(\(w)) AND m.ignored = 0 AND m.meta_state = 1 AND m.thumb_state = 1" }
@@ -346,16 +355,19 @@ extension Library {
                   s.group_id, m.aesthetic DESC, m.size DESC
                 """, args, row)
         }
-        return try db.all("SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w) ORDER BY m.taken_at DESC, m.id DESC", args, row)
+        return try db.all("SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w) "
+                          + "ORDER BY (m.taken_at IS NULL OR m.taken_at > \(future)), m.taken_at DESC, m.id DESC", args, row)
     }
 
     /// Every geotagged, visible photo or video (newest first).
     public func geoPoints() throws -> [GeoPoint] {
         try db.all("""
-            SELECT id, lat, lon, coalesce(aesthetic, 0) FROM media
-            WHERE lat IS NOT NULL AND lon IS NOT NULL AND (lat != 0 OR lon != 0) AND ignored = 0 AND hidden = 0
+            SELECT id, lat, lon, coalesce(aesthetic, 0), coalesce(CAST(strftime('%Y', taken_at, 'unixepoch', 'localtime') AS INTEGER), 0)
+            FROM media
+            WHERE lat IS NOT NULL AND lon IS NOT NULL AND (lat != 0 OR lon != 0) AND ignored = 0 AND hidden = 0 AND dup_of IS NULL
+              AND meta_state = 1 AND thumb_state = 1
             ORDER BY taken_at DESC
-            """) { GeoPoint(id: $0.int(0), lat: $0.double(1), lon: $0.double(2), score: $0.double(3)) }
+            """) { GeoPoint(id: $0.int(0), lat: $0.double(1), lon: $0.double(2), score: $0.double(3), year: Int($0.int(4))) }
     }
 
     public func items(ids: [Int64]) throws -> [MediaItem] {
@@ -377,11 +389,19 @@ extension Library {
         }
     }
 
+    /// Years with photos, newest first, then year 0 = "No date" (none, or in the future) if any.
     public func years() throws -> [(year: Int, count: Int)] {
-        try db.all("SELECT CAST(strftime('%Y', taken_at, 'unixepoch', 'localtime') AS INTEGER) y, count(*) FROM media WHERE taken_at IS NOT NULL AND meta_state = 1 AND thumb_state = 1 AND ignored = 0 AND hidden = 0 AND dup_of IS NULL GROUP BY y ORDER BY y DESC") {
-            (Int($0.int(0)), Int($0.int(1)))
-        }
+        let future = Date().timeIntervalSince1970 + 2 * 86400
+        let visible = "meta_state = 1 AND thumb_state = 1 AND ignored = 0 AND hidden = 0 AND dup_of IS NULL"
+        var out: [(year: Int, count: Int)] = try db.all("""
+            SELECT CAST(strftime('%Y', taken_at, 'unixepoch', 'localtime') AS INTEGER) y, count(*) FROM media
+            WHERE taken_at IS NOT NULL AND taken_at <= ? AND \(visible) GROUP BY y ORDER BY y DESC
+            """, [future]) { (Int($0.int(0)), Int($0.int(1))) }
+        let undated = Int(try db.scalar("SELECT count(*) FROM media WHERE (taken_at IS NULL OR taken_at > ?) AND \(visible)", [future]) ?? 0)
+        if undated > 0 { out.append((0, undated)) }
+        return out
     }
+
 
     public func persons() throws -> [PersonSummary] { try owners(.face) }
 
@@ -421,6 +441,25 @@ extension Library {
 
     // MARK: - Edits (library only; media files are never modified)
 
+    /// Turns photos by quarter turns (+1 = 90° clockwise), like Picasa's rotate (files untouched).
+    public func rotate(_ ids: [Int64], by quarters: Int) throws {
+        try db.transaction {
+            for id in ids { try db.run("UPDATE media SET rotate = ((rotate + ?) % 4 + 4) % 4 WHERE id = ?", quarters, id) }
+        }
+    }
+
+    /// Photos shown turned (Picasa or here): id → quarter turns clockwise.
+    public func rotations() throws -> [Int64: Int] {
+        Dictionary(uniqueKeysWithValues: try db.all("SELECT id, rotate FROM media WHERE rotate % 4 != 0") { ($0.int(0), Int($0.int(1)) % 4) })
+    }
+
+    /// Sets the date a photo was taken by hand (date_source = manual; kept by later index runs).
+    public func setTakenDate(_ ids: [Int64], _ date: Date) throws {
+        try db.transaction {
+            for id in ids { try db.run("UPDATE media SET taken_at = ?, date_source = 4 WHERE id = ?", date.timeIntervalSince1970, id) }
+        }
+    }
+
     public func setStar(_ ids: [Int64], _ on: Bool) throws {
         try db.transaction { for id in ids { try db.run("UPDATE media SET star = ? WHERE id = ?", on, id) } }
     }
@@ -458,8 +497,8 @@ extension Library {
     /// Confirms one suggested face.
     public func confirmSuggestion(faceId: Int64) throws {
         try db.run("""
-            UPDATE faces SET person_id = suggested_person_id, suggested_person_id = NULL, source = ?, human = 1
+            UPDATE faces SET person_id = suggested_person_id, suggested_person_id = NULL, source = ?, human = 1, human_at = ?
             WHERE id = ? AND suggested_person_id IS NOT NULL
-            """, FaceSource.manual.rawValue, faceId)
+            """, FaceSource.manual.rawValue, Date().timeIntervalSince1970, faceId)
     }
 }

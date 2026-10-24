@@ -9,7 +9,7 @@ public actor Library {
     let db: Database
     public nonisolated let thumbs: ThumbnailStore
 
-    public static let schemaVersion: Int64 = 11
+    public static let schemaVersion: Int64 = 12
 
     /// Default location. Deliberately not named like the source folder, so deleting one is never
     /// mistaken for deleting the other.
@@ -40,6 +40,7 @@ public actor Library {
         if v < 9 { try migrateV9(db) }
         if v < 10 { try migrateV10(db) }
         if v < 11 { try migrateV11(db) }
+        if v < 12 { try migrateV12(db) }
         try db.exec("PRAGMA user_version = \(schemaVersion)")
     }
 
@@ -180,6 +181,18 @@ public actor Library {
             DROP INDEX IF EXISTS media_stats;
             CREATE INDEX media_stats ON media(kind, size, meta_state, thumb_state, analysis_state, face_state,
                 ignored, hidden, star, utility, date_source, dup_of);
+            """)
+        }
+    }
+
+    /// v12: a chosen cover per person / pet, and place names for GPS positions (reverse geocoding,
+    /// one row per ~1 km cell).
+    static func migrateV12(_ db: Database) throws {
+        try db.transaction {
+            try db.exec("""
+            ALTER TABLE persons ADD COLUMN cover_id INTEGER;
+            ALTER TABLE pets ADD COLUMN cover_id INTEGER;
+            CREATE TABLE IF NOT EXISTS geo_names(cell TEXT PRIMARY KEY, locality TEXT, area TEXT, country TEXT, at REAL NOT NULL);
             """)
         }
     }

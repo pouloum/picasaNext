@@ -1,4 +1,5 @@
 import AppKit
+import PicasaCore
 import SwiftUI
 
 /// A titled run of consecutive items (a year) in a grid.
@@ -25,13 +26,20 @@ struct GridFrame: Sendable {
     /// Not confirmed by a person yet (suggestion, unnamed): dashed.
     var dashed: Bool
     var width: CGFloat = 2
+    /// The face / animal the grid is about (the one "Frame only" zooms on).
+    var target = false
+    /// Which face / animal it is (clicking the frame opens its naming popup).
+    var regionId: Int64? = nil
+    var kind: IdentityKind? = nil
 }
 
 /// What frames a grid draws on its thumbnails; `id` identifies the rule (a change redraws).
 struct GridFrames: @unchecked Sendable, Equatable {
     let id: String
     let load: @Sendable (Int64) async -> [GridFrame]
-    static func == (a: GridFrames, b: GridFrames) -> Bool { a.id == b.id }
+    /// "Frame only": each thumbnail is cropped around its target (bigger face, easier to judge).
+    var crop = false
+    static func == (a: GridFrames, b: GridFrames) -> Bool { a.id == b.id && a.crop == b.crop }
 }
 
 /// Lets a SwiftUI control (the year rail) scroll the grid.
@@ -81,6 +89,13 @@ struct CollectionGrid: NSViewRepresentable {
     var expanded: Set<Int64> = []
     var members: Set<Int64> = []
     var onBadge: ((Int64) -> Void)? = nil
+    /// A click on a face / animal frame (the frame, the cell's view and the frame's rect in it).
+    var onFrameClick: ((GridFrame, NSView, NSRect) -> Void)? = nil
+    /// Right-click on the selection (a clicked photo outside it becomes the selection): the ids
+    /// selected, and the clicked cell (to anchor a popup).
+    var onRightClick: (([Int64], NSView) -> Void)? = nil
+    /// Bumped when photos were rotated: visible thumbnails are redrawn.
+    var thumbVersion = 0
     var onOpen: (Int) -> Void
     /// Selected item indexes (click, ⌘/⇧-click, arrows), reported after each change.
     var onSelect: (([Int]) -> Void)? = nil
@@ -114,6 +129,15 @@ struct CollectionGrid: NSViewRepresentable {
             }
             guard let i = c.parentIndex(f) else { return }
             c.parent.onOpen(i)
+        }
+        cv.onFrameClick = { [weak coordinator = context.coordinator] frame, view, rect in
+            coordinator?.parent.onFrameClick?(frame, view, rect)
+        }
+        cv.onRightClick = { [weak coordinator = context.coordinator] cv, ip, view in
+            guard let c = coordinator else { return }
+            if !cv.selectionIndexPaths.contains(ip) { cv.selectionIndexPaths = [ip]; c.report(cv) }
+            let ids = cv.selectionIndexPaths.map(c.flat).sorted().compactMap { $0 < c.shownIds.count ? c.shownIds[$0] : nil }
+            c.parent.onRightClick?(ids, view)
         }
         cv.onBadgeClick = { [weak coordinator = context.coordinator] ip in
             guard let c = coordinator else { return }
@@ -152,6 +176,9 @@ struct CollectionGrid: NSViewRepresentable {
         }
         if old.revision != revision {
             for case let item as ThumbItem in cv.visibleItems() { item.retryIfEmpty(cache: thumbs) }
+        }
+        if old.thumbVersion != thumbVersion {
+            for case let item as ThumbItem in cv.visibleItems() { if let id = item.currentId { item.show(id: id, cache: thumbs); item.loadFrames(frames) } }
         }
         if old.frames != frames || (frames != nil && old.revision != revision) {
             for case let item as ThumbItem in cv.visibleItems() { item.loadFrames(frames) }
@@ -357,7 +384,9 @@ struct YearGrid: View {
     var expanded: Set<Int64> = []
     var members: Set<Int64> = []
     var onBadge: ((Int64) -> Void)? = nil
+    var onRightClick: (([Int64], NSView) -> Void)? = nil
     @State private var controller = GridController()
+    @State private var popover: NSPopover?
     @State private var atTop = true
     @State private var newAbove = 0
 
@@ -367,6 +396,8 @@ struct YearGrid: View {
             CollectionGrid(ids: ids, cellSize: cellSize, thumbs: model.thumbs, resetKey: resetKey, revision: model.revision,
                            sections: sections, controller: controller, frames: frames,
                            badges: badges, expanded: expanded, members: members, onBadge: onBadge,
+                           onFrameClick: frames == nil ? nil : { f, v, r in identify(f, v, r) }, onRightClick: onRightClick,
+                           thumbVersion: model.thumbVersion,
                            onOpen: { model.open(ids, at: $0) }, onSelect: onSelect,
                            onTopState: { top, n in atTop = top; newAbove = n })
                 .overlay(alignment: .top) {
@@ -386,6 +417,20 @@ struct YearGrid: View {
                 }
                 .animation(.easeOut(duration: 0.2), value: atTop)
             YearRail(sections: sections, controller: controller)
+        }
+    }
+
+    /// The naming popup of the viewer, on a frame clicked in the grid.
+    func identify(_ f: GridFrame, _ view: NSView, _ rect: NSRect) {
+        guard let id = f.regionId, let kind = f.kind else { return }
+        Task { @MainActor in
+            guard let region = try? await model.library.region(kind, id: id) else { return }
+            popover?.close()
+            let pop = NSPopover()
+            pop.behavior = .transient
+            pop.contentViewController = NSHostingController(rootView: RegionEditor(kind: kind, region: region) { pop.close() }.environmentObject(model))
+            pop.show(relativeTo: rect, of: view, preferredEdge: .maxY)
+            popover = pop
         }
     }
 }
@@ -420,8 +465,22 @@ final class SectionHeader: NSView, NSCollectionViewElement {
 final class DoubleClickCollectionView: NSCollectionView {
     var onDoubleClick: ((IndexPath) -> Void)?
     var onBadgeClick: ((IndexPath) -> Void)?
+    var onFrameClick: ((GridFrame, NSView, NSRect) -> Void)?
+    var onRightClick: ((NSCollectionView, IndexPath, NSView) -> Void)?
+
+    override func rightMouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard onRightClick != nil, let ip = indexPathForItem(at: p), let item = item(at: ip) else { super.rightMouseDown(with: event); return }
+        onRightClick?(self, ip, item.view)
+    }
+
     override func mouseDown(with event: NSEvent) {
         let p0 = convert(event.locationInWindow, from: nil)
+        // A plain click on a face / animal frame opens its naming popup (⌘ / ⇧-click still select).
+        if event.clickCount == 1, onFrameClick != nil, event.modifierFlags.intersection([.command, .shift]).isEmpty, let ip = indexPathForItem(at: p0), let item = item(at: ip) as? ThumbItem,
+           let (frame, rect) = item.frameHit(convert(p0, to: item.view)) {
+            onFrameClick?(frame, item.view, rect); return
+        }
         // A click on a group's badge opens / closes the group (and does not select).
         if event.clickCount == 1, let ip = indexPathForItem(at: p0), let item = item(at: ip) as? ThumbItem,
            item.badgeHit(convert(p0, to: item.view)) {
@@ -500,36 +559,86 @@ final class ThumbItem: NSCollectionViewItem {
         view.layer?.backgroundColor = (member ? NSColor.controlAccentColor.withAlphaComponent(0.35) : NSColor.quaternaryLabelColor).cgColor
     }
 
+    /// The frame under a point of the cell (and its rect in the cell's coordinates), if it can be named.
+    func frameHit(_ p: NSPoint) -> (GridFrame, NSRect)? {
+        guard let (f, r) = overlay.frameAt(convert(p, toOverlay: true)), f.regionId != nil else { return nil }
+        return (f, overlay.convert(r, to: view))
+    }
+
+    private func convert(_ p: NSPoint, toOverlay: Bool) -> NSPoint { view.convert(p, to: overlay) }
+
     func badgeHit(_ p: NSPoint) -> Bool { hasBadge && !badge.isHidden && badge.frame.insetBy(dx: -4, dy: -4).contains(p) }
+
+    /// Quarter turns of the photo shown (frames are turned with it).
+    private var turn = 0
 
     func show(id: Int64, cache: ThumbnailCache) {
         current = id
-        if let img = cache.cached(id) { image.image = img; drawFrames(); return }
+        turn = cache.rotation(id)
+        if let img = cache.cached(id) { full = img; refresh(); return }
+        full = nil
         image.image = nil
         Task { @MainActor in
             let img = await cache.load(id)
-            if self.current == id { self.image.image = img; self.drawFrames() }
+            if self.current == id { self.full = img; self.refresh() }
         }
     }
 
     func retryIfEmpty(cache: ThumbnailCache) {
-        if image.image == nil, let id = current { show(id: id, cache: cache) }
+        if full == nil, let id = current { show(id: id, cache: cache) }
     }
 
     // MARK: Frames
 
     private let overlay = FramesOverlay()
 
+    private var full: NSImage?        // the whole thumbnail (the view may show a crop of it)
+    private var cropMode = false      // "Frame only"
+    private var rawFrames: [GridFrame] = []
+
     func loadFrames(_ spec: GridFrames?) {
-        guard let spec, let id = current else { setFrames([]); return }
+        guard let spec, let id = current else { cropMode = false; setFrames([]); return }
         Task { @MainActor in
             let f = await spec.load(id)
-            if self.current == id { self.setFrames(f) }
+            guard self.current == id else { return }
+            self.cropMode = spec.crop
+            let q = self.turn
+            self.setFrames(q == 0 ? f : f.map { g in
+                var t = g
+                (t.x, t.y, t.w, t.h) = Turn.rect(g.x, g.y, g.w, g.h, q)
+                return t
+            })
         }
     }
 
     private func setFrames(_ f: [GridFrame]) {
-        overlay.frames = f
+        rawFrames = f
+        refresh()
+    }
+
+    /// Shows the whole thumbnail with its frames, or — "Frame only" — a square crop around the
+    /// largest target region (1.8× its size, inside the picture) with the frames moved into it.
+    private func refresh() {
+        guard let img = full else { image.image = nil; overlay.frames = []; drawFrames(); return }
+        guard cropMode, let t = rawFrames.filter(\.target).max(by: { $0.w * $0.h < $1.w * $1.h }),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            image.image = img; overlay.frames = rawFrames; drawFrames(); return
+        }
+        let W = CGFloat(cg.width), H = CGFloat(cg.height)
+        let side = min(max(t.w * W, t.h * H) * 1.8, W, H)
+        let x = min(max(0, (t.x + t.w / 2) * W - side / 2), W - side), y = min(max(0, (t.y + t.h / 2) * H - side / 2), H - side)
+        let px = CGRect(x: x, y: y, width: side, height: side).integral
+        guard let piece = cg.cropping(to: px) else { image.image = img; overlay.frames = rawFrames; drawFrames(); return }
+        image.image = NSImage(cgImage: piece, size: NSSize(width: piece.width, height: piece.height))
+        let c = CGRect(x: px.minX / W, y: px.minY / H, width: px.width / W, height: px.height / H)
+        overlay.frames = rawFrames.compactMap { g in
+            let r = CGRect(x: g.x, y: g.y, width: g.w, height: g.h).intersection(c)
+            guard !r.isNull, r.width > 0 else { return nil }
+            var h = g
+            h.x = (r.minX - c.minX) / c.width; h.y = (r.minY - c.minY) / c.height
+            h.w = r.width / c.width; h.h = r.height / c.height
+            return h
+        }
         drawFrames()
     }
 
@@ -547,6 +656,8 @@ final class ThumbItem: NSCollectionViewItem {
     override func prepareForReuse() {
         super.prepareForReuse()
         image.image = nil
+        full = nil
+        cropMode = false
         current = nil
         setFrames([])
         setGroup(count: nil, open: false, member: false)
@@ -559,6 +670,24 @@ final class FramesOverlay: NSView {
     var imageSize: CGSize = .zero
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil } // clicks go to the cell
+
+    var picture: CGRect {
+        let b = bounds
+        guard imageSize.width > 0, imageSize.height > 0 else { return b }
+        let s = min(b.width / imageSize.width, b.height / imageSize.height)
+        return CGRect(x: (b.width - imageSize.width * s) / 2, y: (b.height - imageSize.height * s) / 2,
+                      width: imageSize.width * s, height: imageSize.height * s)
+    }
+
+    func rect(_ f: GridFrame) -> CGRect {
+        let pic = picture
+        return CGRect(x: pic.minX + f.x * pic.width, y: pic.minY + f.y * pic.height, width: f.w * pic.width, height: f.h * pic.height)
+    }
+
+    /// Smallest frame containing the point (a face inside a group photo wins over a bigger box).
+    func frameAt(_ p: NSPoint) -> (GridFrame, CGRect)? {
+        frames.map { ($0, rect($0)) }.filter { $0.1.insetBy(dx: -3, dy: -3).contains(p) }.min { $0.1.width * $0.1.height < $1.1.width * $1.1.height }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard !frames.isEmpty, imageSize.width > 0, imageSize.height > 0 else { return }

@@ -1,5 +1,8 @@
 # PicasaNext
 
+
+Full technical and functional reference: [docs/FEATURES.md](docs/FEATURES.md)
+
 A native macOS replacement for the core of Google Picasa 3.9, written in Swift, built for
 large libraries (2 TB+, hundreds of thousands of photos and videos). It imports what Picasa knew
 about your photos (stars, captions, named faces, albums, keywords, edits) and never writes to

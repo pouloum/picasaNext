@@ -79,7 +79,6 @@ struct RelationsView: View {
     @State private var scale: CGFloat = 1
     @State private var offset: CGSize = .zero
     @GestureState private var pinch: CGFloat = 1
-    @GestureState private var drag: CGSize = .zero
     @State private var hover: Int?
     @State private var focus: Int?
     @State private var panel: Panel?
@@ -99,6 +98,9 @@ struct RelationsView: View {
     @State private var pathStart: Int?
     @State private var path: [Int]?
     @State private var layoutTask: Task<Void, Never>?
+    /// Node being dragged (-1: the background, i.e. panning).
+    @State private var dragging: Int?
+    @State private var panDrag: CGSize = .zero
 
     struct Panel: Equatable { var title: String; var subtitle: String; var mediaIds: [Int64]; var node: Int }
     /// People photographed together within the years shown: weight = photos, and which photos.
@@ -177,6 +179,10 @@ struct RelationsView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            if !loading, let g = graph, !g.moments.isEmpty {
+                sidePanel
+                Divider()
+            }
             ZStack(alignment: .topLeading) {
                 if loading {
                     ProgressView("Building the graph…").frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -192,8 +198,8 @@ struct RelationsView: View {
                         .onContinuousHover { phase in
                             if case let .active(p) = phase { hover = hit(p); mouseInside = true } else { hover = nil; mouseInside = false }
                         }
-                    topBar.padding(10)
-                    VStack { Spacer(); HStack(alignment: .bottom) { yearBar; Spacer(); controls } }.padding(10)
+                    statusBanner.padding(10)
+                    VStack { Spacer(); HStack { Spacer(); controls } }.padding(10)
                     if let h = hover { tooltip(h) }
                 }
             }
@@ -228,7 +234,7 @@ struct RelationsView: View {
     // MARK: Drawing
 
     func toView(_ p: CGPoint) -> CGPoint {
-        CGPoint(x: p.x * zoom + size.width / 2 + offset.width + drag.width, y: p.y * zoom + size.height / 2 + offset.height + drag.height)
+        CGPoint(x: p.x * zoom + size.width / 2 + offset.width + panDrag.width, y: p.y * zoom + size.height / 2 + offset.height + panDrag.height)
     }
 
     func toGraph(_ p: CGPoint) -> CGPoint {
@@ -382,40 +388,85 @@ struct RelationsView: View {
         return (m.people.compactMap { names[$0] }.joined(separator: ", "), "\(n) photo\(n > 1 ? "s" : "") together" + (years.isEmpty ? "" : " · \(years)"))
     }
 
-    var topBar: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Relations").font(.headline)
-                let vis = visibleNodes
-                Text("\(vis.filter(isPerson).count) people · \(showMoments ? "\(vis.count - vis.filter(isPerson).count) moments" : "\(edges.count) links")")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Divider().frame(height: 28)
-            HStack(spacing: 6) {
-                Text("At least").font(.caption)
-                Stepper(value: $minTogether, in: 1...50) { Text("\(minTogether)").monospacedDigit().frame(width: 22) }
-                Text("photos together").font(.caption)
-            }
-            .help("Hide links between people photographed together fewer times")
-            Toggle("Moments", isOn: $showMoments).toggleStyle(.checkbox)
-                .help("Also show the photos each group of people shares (squares)")
-            Text("click: links · double-click: centre · ⌘-click two people: path").font(.caption2).foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(alignment: .bottomLeading) {
-            if let e = ego, let g = graph {
-                HStack(spacing: 8) {
-                    Text("Centred on \(g.people[e].name) — rings by photos together").font(.callout.bold())
-                    Button("Back to everyone") { exitEgo() }
+    /// Controls in a vertical panel on the left (like the filters of the other views), so the graph
+    /// keeps the whole height and width.
+    var sidePanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Relations").font(.headline)
+                    let vis = visibleNodes
+                    Text("\(vis.filter(isPerson).count) people · \(showMoments ? "\(vis.count - vis.filter(isPerson).count) moments" : "\(edges.count) links")")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 12).padding(.vertical, 6).background(.regularMaterial, in: Capsule())
-                .offset(y: 44)
-            } else if let s = pathStart, let g = graph {
-                Text("Path from \(g.people[s].name): ⌘-click another person").font(.callout)
-                    .padding(.horizontal, 12).padding(.vertical, 6).background(.regularMaterial, in: Capsule())
-                    .offset(y: 44)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Links").font(.subheadline.bold())
+                    Stepper(value: $minTogether, in: 1...50) { Text("At least \(minTogether) photo\(minTogether > 1 ? "s" : "") together").font(.callout) }
+                        .help("Hide links between people photographed together fewer times")
+                    Toggle("Show moments", isOn: $showMoments).toggleStyle(.checkbox)
+                        .help("Also show the photos each group of people shares (squares)")
+                }
+                if let range = yearRange {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Years").font(.subheadline.bold())
+                        HStack {
+                            Button { if !playing && (year ?? range.upperBound) >= range.upperBound { year = range.lowerBound }; playing.toggle() } label: {
+                                Image(systemName: playing ? "pause.fill" : "play.fill")
+                            }
+                            .help("Play the years")
+                            Text(year.map { cumulative ? "≤ \($0)" : "\($0)" } ?? "All years").monospacedDigit()
+                            Spacer()
+                            if year != nil { Button("All") { playing = false; year = nil; refreshAfterYear() } }
+                        }
+                        Slider(value: Binding(get: { Double(year ?? range.upperBound) }, set: { year = Int($0.rounded()); refreshAfterYear() }),
+                               in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
+                        Toggle("Up to that year", isOn: $cumulative).toggleStyle(.checkbox)
+                            .help("Everything up to the chosen year (otherwise that year only)")
+                            .onChange(of: cumulative) { refreshAfterYear() }
+                    }
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("How to").font(.subheadline.bold())
+                    Group {
+                        Text("Click a person: their links and photos")
+                        Text("Double-click: centred view")
+                        Text("⌘-click two people: the chain between them")
+                        Text("Drag a person to move them; drag the background to pan; pinch or ⌘-scroll to zoom")
+                    }
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if let g = graph {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Circles").font(.subheadline.bold())
+                        let groups = Dictionary(grouping: visibleNodes.filter(isPerson), by: { g.people[$0].community })
+                            .sorted { $0.value.count > $1.value.count }.prefix(8)
+                        ForEach(Array(groups), id: \.key) { c, members in
+                            HStack(spacing: 6) {
+                                Circle().fill(Color(nsColor: Self.palette[c % Self.palette.count])).frame(width: 10, height: 10)
+                                let lead = members.max { g.people[$0].photos < g.people[$1].photos }.map { g.people[$0].name } ?? ""
+                                Text("\(lead) + \(members.count - 1)").font(.caption).lineLimit(1)
+                            }
+                        }
+                    }
+                }
             }
+            .padding(12)
+        }
+        .frame(width: 230)
+        .background(.regularMaterial)
+    }
+
+    /// Ego view / path being chosen: a reminder at the top of the graph.
+    @ViewBuilder var statusBanner: some View {
+        if let e = ego, let g = graph {
+            HStack(spacing: 8) {
+                Text("Centred on \(g.people[e].name) — rings by photos together").font(.callout.bold())
+                Button("Back to everyone") { exitEgo() }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6).background(.regularMaterial, in: Capsule())
+        } else if let s = pathStart, let g = graph {
+            Text("Path from \(g.people[s].name): ⌘-click another person").font(.callout)
+                .padding(.horizontal, 12).padding(.vertical, 6).background(.regularMaterial, in: Capsule())
         }
     }
 
@@ -429,31 +480,27 @@ struct RelationsView: View {
         .buttonStyle(.bordered)
     }
 
-    @ViewBuilder var yearBar: some View {
-        if let range = yearRange {
-            HStack(spacing: 8) {
-                Button { if !playing && (year ?? range.upperBound) >= range.upperBound { year = range.lowerBound }; playing.toggle() } label: {
-                    Image(systemName: playing ? "pause.fill" : "play.fill")
-                }
-                .help("Play the years")
-                Slider(value: Binding(get: { Double(year ?? range.upperBound) }, set: { year = Int($0.rounded()); refreshAfterYear() }),
-                       in: Double(range.lowerBound)...Double(range.upperBound), step: 1)
-                    .frame(width: 220)
-                Text(year.map { cumulative ? "≤ \($0)" : "\($0)" } ?? "All years").monospacedDigit().frame(width: 70, alignment: .leading)
-                Toggle("Up to", isOn: $cumulative).toggleStyle(.checkbox).help("Everything up to the chosen year (otherwise that year only)")
-                    .onChange(of: cumulative) { refreshAfterYear() }
-                if year != nil { Button("All") { playing = false; year = nil; refreshAfterYear() } }
-            }
-            .padding(8).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-        }
-    }
-
     // MARK: Interaction
 
+    /// Dragging a person (or a moment) moves it; dragging the background pans.
     var panGesture: some Gesture {
         DragGesture(minimumDistance: 3)
-            .updating($drag) { v, s, _ in s = v.translation }
-            .onEnded { v in offset.width += v.translation.width; offset.height += v.translation.height }
+            .onChanged { v in
+                if dragging == nil { dragging = hit(v.startLocation) ?? -1 }
+                if let n = dragging, n >= 0 {
+                    // A moved node stays where it is put: stop the layout still settling.
+                    if settling { layoutTask?.cancel(); settling = false }
+                    let p = toGraph(v.location)
+                    if ego != nil { egoPos[n] = p } else { positions[n] = p }
+                } else {
+                    panDrag = v.translation
+                }
+            }
+            .onEnded { v in
+                if dragging == -1 { offset.width += v.translation.width; offset.height += v.translation.height }
+                panDrag = .zero
+                dragging = nil
+            }
     }
 
     /// Two-finger scroll moves the graph, pinch or ⌘-scroll (or a mouse wheel) zooms.
@@ -528,8 +575,8 @@ struct RelationsView: View {
         guard !pts.isEmpty, size.width > 0 else { return }
         let xs = pts.map(\.x), ys = pts.map(\.y)
         let (x0, x1, y0, y1) = (xs.min()!, xs.max()!, ys.min()!, ys.max()!)
-        scale = min(3, max(0.1, 0.9 * min(size.width / (x1 - x0 + 160), (size.height - 120) / (y1 - y0 + 160))))
-        offset = CGSize(width: -(x0 + x1) / 2 * scale, height: -(y0 + y1) / 2 * scale + 20)
+        scale = min(3, max(0.1, 0.96 * min(size.width / (x1 - x0 + 90), (size.height - 30) / (y1 - y0 + 90))))
+        offset = CGSize(width: -(x0 + x1) / 2 * scale, height: -(y0 + y1) / 2 * scale)
     }
 
     // MARK: Ego, path, years
@@ -694,8 +741,9 @@ struct RelationsView: View {
     func loadImages(_ g: RelationsGraph) async {
         for (i, p) in g.people.enumerated() {
             guard images[i] == nil, let fid = p.coverFaceId, let f = try? await model.library.face(id: fid),
-                  let thumb = await model.thumbs.load(f.mediaId), let cg = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil),
-                  let c = RegionThumb.crop(cg, f, margin: 1.5) else { continue }
+                  let thumb = await model.thumbs.loadRaw(f.mediaId), let cg = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let c0 = RegionThumb.crop(cg, f, margin: 1.5) else { continue }
+            let c = Turn.image(c0, model.thumbs.rotation(f.mediaId))
             images[i] = NSImage(cgImage: c, size: NSSize(width: c.width, height: c.height))
         }
         for (mi, m) in g.moments.enumerated().prefix(400) {

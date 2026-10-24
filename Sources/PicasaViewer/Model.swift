@@ -26,6 +26,31 @@ final class AppModel: ObservableObject {
     /// Grouped views (duplicates, bursts, similar): one cover per group, expanded on demand.
     @Published var groups: [MediaGroup] = []
     @Published var expanded: Set<Int64> = []
+    /// Navigation requests from the info panel's links (a person, a pet, a label, a place).
+    struct OwnerRequest: Equatable { let kind: IdentityKind; let id: Int64 }
+    @Published var openOwner: OwnerRequest?
+    @Published var openLabel: String?
+    @Published var openPlace: GeoPoint?
+
+    /// Info panel link: closes the viewer and opens the right page.
+    func go(to target: SidebarItem, owner: OwnerRequest? = nil, label: String? = nil, place: GeoPoint? = nil) {
+        viewing = nil
+        clearSearch()
+        selection = target
+        // Set after the page appears so its onChange sees it.
+        DispatchQueue.main.async {
+            if let owner { self.openOwner = owner }
+            if let label { self.openLabel = label }
+            if let place { self.openPlace = place }
+        }
+    }
+
+    /// A text field of a popup (naming, date) has the keyboard: the viewer's one-key shortcuts
+    /// (space, S, F, [, ], arrows, Esc…) must not fire while typing.
+    @Published var typing = false
+
+    /// Photos selected in the main grid (for Show in Finder).
+    @Published var gridSelection: [Int64] = []
     var groupBadges: [Int64: Int] { Dictionary(uniqueKeysWithValues: groups.map { ($0.cover, $0.members.count) }) }
     /// Members shown under an expanded cover (tinted in the grid).
     var expandedMembers: Set<Int64> { Set(groups.filter { expanded.contains($0.cover) }.flatMap { $0.members.dropFirst() }) }
@@ -62,6 +87,7 @@ final class AppModel: ObservableObject {
         thumbs = ThumbnailCache(store: library.thumbs)
         Task {
             // The grid first (what the user looks at), then the sidebar and counters.
+            await loadRotations()
             await reloadGrid()
             loaded = true
             await refreshAll()
@@ -159,6 +185,28 @@ final class AppModel: ObservableObject {
         } catch { self.error = "\(error)"; ids = []; sections = [] }
     }
 
+    /// Show in Finder: the selected photos, or else the folder being shown.
+    func revealInFinder() {
+        Task {
+            if !gridSelection.isEmpty, let items = try? await library.items(ids: Array(gridSelection.prefix(200))) {
+                NSWorkspace.shared.activateFileViewerSelecting(items.map(\.url))
+            } else if case let .filter(.folder(id), _)? = selection, let f = folders.first(where: { $0.id == id }) {
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: f.path)
+            }
+        }
+    }
+
+    var canReveal: Bool {
+        if !gridSelection.isEmpty { return true }
+        if case .filter(.folder, _)? = selection { return true }
+        return false
+    }
+
+    /// Names the places of geotagged photos (background job; slow because Apple throttles requests).
+    func geocode() {
+        runJob("Naming places") { lib, report in _ = try await Geocoder(library: lib).run { report($0) } }
+    }
+
     func flattenGroups() -> [Int64] {
         groups.flatMap { expanded.contains($0.cover) ? $0.members : [$0.cover] }
     }
@@ -227,6 +275,8 @@ final class AppModel: ObservableObject {
             for d in [dir.appendingPathComponent("db3"), dir] where fm.fileExists(atPath: d.appendingPathComponent("thumbindex.db").path) {
                 _ = try await lib.importDB3(at: d) { report($0) }; break
             }
+            // Names imported on a hidden copy go to the photo kept (and on to its other copies).
+            try await lib.mirrorToCopies(.face)
             _ = try await FaceEngine(library: lib).suggestNames()
         }
     }
@@ -271,6 +321,19 @@ final class AppModel: ObservableObject {
 
     // MARK: - Edits
 
+    /// Bumped when rotations change: visible thumbnails are redrawn.
+    @Published var thumbVersion = 0
+
+    func loadRotations() async {
+        thumbs.rotations = (try? await library.rotations()) ?? [:]
+    }
+
+    func rotate(_ ids: [Int64], by quarters: Int) async {
+        try? await library.rotate(ids, by: quarters)
+        await loadRotations()
+        thumbVersion += 1
+    }
+
     func toggleStar(_ item: MediaItem) async {
         try? await library.setStar([item.id], !item.star)
     }
@@ -280,7 +343,9 @@ final class AppModel: ObservableObject {
     /// Runs an edit, then refreshes suggestions so similar faces / animals get proposed.
     func identityEdit(_ k: IdentityKind, _ body: @escaping @Sendable (Library) async throws -> Void) async {
         do {
+            let since = Date().timeIntervalSince1970
             try await body(library)
+            try await library.mirrorToCopies(k, since: since) // only the photos just edited
             _ = try await IdentityEngine.suggest(library: library, kind: k, threshold: 0.82)
         } catch { self.error = "\(error)" }
         await refreshAll()
@@ -329,27 +394,77 @@ final class AppModel: ObservableObject {
     }
 }
 
+/// Quarter-turn rotations (clockwise) of pictures and of normalized rectangles (top-left origin).
+enum Turn {
+    static func image(_ cg: CGImage, _ q: Int) -> CGImage {
+        let q = ((q % 4) + 4) % 4
+        guard q != 0 else { return cg }
+        let (w, h) = (cg.width, cg.height)
+        let (ow, oh) = q % 2 == 1 ? (h, w) : (w, h)
+        guard let ctx = CGContext(data: nil, width: ow, height: oh, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return cg }
+        // Core Graphics is bottom-left based: a clockwise turn on screen is a negative angle here.
+        ctx.translateBy(x: CGFloat(ow) / 2, y: CGFloat(oh) / 2)
+        ctx.rotate(by: -CGFloat(q) * .pi / 2)
+        ctx.draw(cg, in: CGRect(x: -CGFloat(w) / 2, y: -CGFloat(h) / 2, width: CGFloat(w), height: CGFloat(h)))
+        return ctx.makeImage() ?? cg
+    }
+
+    static func nsImage(_ img: NSImage, _ q: Int) -> NSImage {
+        guard q % 4 != 0, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return img }
+        let r = image(cg, q)
+        return NSImage(cgImage: r, size: NSSize(width: r.width, height: r.height))
+    }
+
+    /// (x, y, w, h) in the unturned picture → in the picture turned `q` quarters clockwise.
+    static func rect(_ x: Double, _ y: Double, _ w: Double, _ h: Double, _ q: Int) -> (Double, Double, Double, Double) {
+        switch ((q % 4) + 4) % 4 {
+        case 1: (1 - y - h, x, h, w)
+        case 2: (1 - x - w, 1 - y - h, w, h)
+        case 3: (y, 1 - x - w, h, w)
+        default: (x, y, w, h)
+        }
+    }
+}
+
 /// In-memory thumbnail cache in front of the on-disk ThumbnailStore. Thumbnails are only made by
 /// the indexer (picasa-cli index / the app's jobs); the grids only show items that have one.
+/// `load` gives the picture as shown (turned by the photo's rotation); `loadRaw` as stored (for crops
+/// computed from face / animal boxes, which are in the unturned picture).
 final class ThumbnailCache: @unchecked Sendable {
     private let cache = NSCache<NSNumber, NSImage>()
     let store: ThumbnailStore
+    /// id → quarter turns clockwise (photos rotated in Picasa or here).
+    var rotations: [Int64: Int] = [:]
 
     init(store: ThumbnailStore) {
         self.store = store
         cache.countLimit = 4000
     }
 
-    func cached(_ id: Int64) -> NSImage? { cache.object(forKey: NSNumber(value: id)) }
+    func rotation(_ id: Int64) -> Int { rotations[id] ?? 0 }
+    private func key(_ id: Int64, _ q: Int) -> NSNumber { NSNumber(value: id * 4 + Int64(q)) }
 
-    func load(_ id: Int64) async -> NSImage? {
-        if let i = cached(id) { return i }
+    func cached(_ id: Int64) -> NSImage? { cache.object(forKey: key(id, rotation(id))) }
+
+    func loadRaw(_ id: Int64) async -> NSImage? {
+        if let i = cache.object(forKey: key(id, 0)) { return i }
         let store = store
         let img = await Task.detached(priority: .userInitiated) { () -> NSImage? in
             guard let cg = store.load(id: id) else { return nil }
             return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         }.value
-        if let img { cache.setObject(img, forKey: NSNumber(value: id)) }
+        if let img { cache.setObject(img, forKey: key(id, 0)) }
         return img
+    }
+
+    func load(_ id: Int64) async -> NSImage? {
+        let q = rotation(id)
+        if let i = cache.object(forKey: key(id, q)) { return i }
+        guard let raw = await loadRaw(id) else { return nil }
+        guard q != 0 else { return raw }
+        let turned = Turn.nsImage(raw, q)
+        cache.setObject(turned, forKey: key(id, q))
+        return turned
     }
 }

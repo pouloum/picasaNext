@@ -24,6 +24,7 @@ struct IdentitiesView: View {
     @AppStorage private var showUnnamed: Bool
     @AppStorage private var showIgnored: Bool
     @AppStorage("grid.showFrames") private var showFrames = true
+    @AppStorage("grid.frameOnly") private var frameOnly = false
     @State private var year = 0 // 0 = all years
 
     @State private var owners: [PersonSummary] = []
@@ -67,6 +68,24 @@ struct IdentitiesView: View {
     struct LoadKey: Hashable { var revision, year: Int; var named, unnamed, ignored, photos: Bool }
 
     var body: some View {
+        // The load task sits outside the branches: counts (photos, to confirm) stay current while a
+        // person's page is open, and are right when coming back to the cards.
+        Group { page }
+            .task(id: LoadKey(revision: model.revision, year: year, named: showNamed, unnamed: showUnnamed, ignored: showIgnored, photos: photosMode)) {
+                await load()
+            }
+            .onChange(of: model.openOwner) { _, req in openRequested(req) }
+            .onAppear { openRequested(model.openOwner) }
+    }
+
+    /// A link (info panel) asked for this person / pet.
+    func openRequested(_ req: AppModel.OwnerRequest?) {
+        guard let req, req.kind == kind else { return }
+        selectedId = req.id
+        model.openOwner = nil
+    }
+
+    @ViewBuilder var page: some View {
         if let p = owners.first(where: { $0.id == selectedId }) {
             OwnerDetail(kind: kind, owner: p, back: { selectedId = nil },
                         rename: { newName = p.name; renaming = p })
@@ -78,9 +97,6 @@ struct IdentitiesView: View {
                 filterBar
                 Divider()
                 content.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .task(id: LoadKey(revision: model.revision, year: year, named: showNamed, unnamed: showUnnamed, ignored: showIgnored, photos: photosMode)) {
-                await load()
             }
             .sheet(item: $sheet) { t in ClusterSheet(kind: kind, cluster: t.cluster, ignoredGroup: t.ignored).environmentObject(model) }
             .alert("Merge “\(merging?.source.name ?? "")” into “\(merging?.target.name ?? "")”?",
@@ -125,7 +141,7 @@ struct IdentitiesView: View {
             Picker("", selection: $year) {
                 Text("All years").tag(0)
                 Divider()
-                ForEach(model.years, id: \.year) { y in Text(String(y.year)).tag(y.year) }
+                ForEach(model.years.filter { $0.year > 0 }, id: \.year) { y in Text(String(y.year)).tag(y.year) }
             }
             .labelsHidden().fixedSize()
 
@@ -155,7 +171,11 @@ struct IdentitiesView: View {
         } else if photosMode {
             if photoIds.isEmpty { emptySelection } else {
                 YearGrid(ids: photoIds, sections: photoSections, resetKey: [kind.rawValue, String(year), "\(showNamed)\(showUnnamed)\(showIgnored)"],
-                         frames: showFrames ? .identities(model.library, kind, named: showNamed, unnamed: showUnnamed, ignored: showIgnored) : nil)
+                         frames: showFrames ? .identities(model.library, kind, named: showNamed, unnamed: showUnnamed, ignored: showIgnored, crop: frameOnly) : nil,
+                         onRightClick: { ids, view in
+                             Popup.show(PhotoRegionsActions(kind: kind, mediaIds: ids, named: showNamed, unnamed: showUnnamed, ignored: showIgnored),
+                                        model: model, at: view)
+                         })
             }
         } else if visibleGroups == 0 {
             emptySelection
@@ -343,7 +363,7 @@ struct IdentitiesView: View {
             Text(t).font(.headline)
             Text(hint).font(.caption).foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity, alignment: .leading).padding([.horizontal, .top])
+        .frame(maxWidth: .infinity, alignment: .leading).padding([.horizontal, .top]).padding(.bottom, 12)
     }
 
     func card(key: String, regionId: Int64?, title: String, subtitle: String) -> some View {
@@ -407,20 +427,26 @@ struct IdentitiesView: View {
         let lib = model.library
         if kind == .pet { await model.ensurePetPrints() }
         let y: Int? = year == 0 ? nil : year
-        counts = (try? await lib.identityCounts(kind, year: y)) ?? (0, 0, 0)
-        duplicates = (try? await lib.duplicateOwners(kind)) ?? []
-        owners = (try? await lib.owners(kind, year: y)) ?? []
+        // Everything is read first, then shown at once — and not at all if a newer load started
+        // meanwhile (edits come in bursts: an older, slower load must not overwrite fresh counts).
+        let c = (try? await lib.identityCounts(kind, year: y)) ?? (0, 0, 0)
+        let d = (try? await lib.duplicateOwners(kind)) ?? []
+        let o = (try? await lib.owners(kind, year: y)) ?? []
+        guard !Task.isCancelled else { return }
+        counts = c; duplicates = d; owners = o
         if photosMode {
             let rows = (try? await lib.mediaIdsAndYears(.identities(kind, named: showNamed, unnamed: showUnnamed, ignored: showIgnored, year: y))) ?? []
+            guard !Task.isCancelled else { return }
             photoIds = rows.map(\.id)
             photoSections = GridSection.byYear(rows.map(\.year))
         } else {
             // Clustering is the expensive part: only redo it when the items or the year changed.
             let key = ((try? await lib.identityToken(kind)) ?? []) + [Int64(year), showUnnamed ? 1 : 0, showIgnored ? 1 : 0]
             if key != clusterKey {
-                clusters = showUnnamed ? ((try? await lib.identityClusters(kind, year: y)) ?? []) : []
-                ignoredClusters = showIgnored ? ((try? await lib.identityClusters(kind, ignored: true, year: y)) ?? []) : []
-                clusterKey = key
+                let cl = showUnnamed ? ((try? await lib.identityClusters(kind, year: y)) ?? []) : []
+                let ig = showIgnored ? ((try? await lib.identityClusters(kind, ignored: true, year: y)) ?? []) : []
+                guard !Task.isCancelled else { return }
+                clusters = cl; ignoredClusters = ig; clusterKey = key
             }
         }
         loaded = true
@@ -448,7 +474,9 @@ struct OwnerDetail: View {
     /// suggestions (recomputed from what was just confirmed) are.
     @State private var acted = 0
     @AppStorage("grid.showFrames") private var showFrames = true
+    @AppStorage("grid.frameOnly") private var frameOnly = false
     @State private var moving = false
+    @State private var rejectingAll = false
     @State private var moveName = ""
     @State private var known: [String] = []
 
@@ -479,6 +507,10 @@ struct OwnerDetail: View {
                     Button { Task { await act(confirm: false, chosen) } } label: { Label("Reject", systemImage: "xmark") }
                         .disabled(chosen.isEmpty)
                     Spacer()
+                    Button("Reject all \(suggested.count)") { rejectingAll = true }
+                        .confirmationDialog("Reject all \(suggested.count) suggestions for \(owner.name)?", isPresented: $rejectingAll) {
+                            Button("Reject all", role: .destructive) { Task { await act(confirm: false, suggested.map(\.id)); acted += 1 } }
+                        } message: { Text("They will not be suggested as \(owner.name) again (and their look-alikes neither).") }
                     Button("Confirm all \(suggested.count)") { Task { await model.confirmAll(kind, owner); await reload(); acted += 1 } }
                 }
                 .padding(.horizontal, 10).padding(.bottom, 6)
@@ -494,6 +526,9 @@ struct OwnerDetail: View {
                     Button { moveName = ""; moving = true } label: { Label("Move to…", systemImage: "arrow.right.circle") }
                         .disabled(chosen.isEmpty)
                         .popover(isPresented: $moving, arrowEdge: .bottom) { moveForm(chosen) }
+                    Button { Task { await setCover(chosen.first!) } } label: { Label("Set as cover", systemImage: "person.crop.square.badge.camera") }
+                        .disabled(chosen.count != 1)
+                        .help("Show this photo's \(kind.itemWord) on \(owner.name)'s card (default: the best-looking photo)")
                     Spacer()
                 }
                 .padding(.horizontal, 10).padding(.bottom, 6)
@@ -504,7 +539,8 @@ struct OwnerDetail: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 YearGrid(ids: ids, sections: GridSection.byYear(rows.map(\.year)), resetKey: [owner.id, showSuggested ? 1 : 0, Int64(acted)],
-                         onSelect: { selection = $0 }, frames: showFrames ? .identities(model.library, kind, owner: owner.id) : nil)
+                         onSelect: { selection = $0 }, frames: showFrames ? .identities(model.library, kind, owner: owner.id, crop: frameOnly) : nil,
+                         onRightClick: { ids, view in Popup.show(PhotoRegionsActions(kind: kind, mediaIds: ids, owner: owner), model: model, at: view) })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -526,6 +562,13 @@ struct OwnerDetail: View {
         }
         .padding(14)
         .task { known = ((try? await model.library.owners(kind)) ?? []).map(\.name) }
+    }
+
+    func setCover(_ mediaId: Int64) async {
+        let (k, o) = (kind, owner.id)
+        let ids = (try? await model.library.regionIds(k, owner: o, mediaIds: [mediaId])) ?? []
+        try? await model.library.setCover(k, owner: o, region: ids.first)
+        await model.refreshAll()
     }
 
     func unassign(_ mediaIds: [Int64]) async {
@@ -654,13 +697,16 @@ struct RegionThumb: View {
             // 1. Crop already cached on disk (local, next to the thumbnails). Pets use negative ids.
             let store = model.thumbs.store
             let cached = store.faceURL(id: kind == .face ? f.id : -f.id, x: f.x, y: f.y, w: f.w)
+            // Crops are cut from the unturned picture, then shown turned like the photo.
+            let q = model.thumbs.rotation(f.mediaId)
+            @MainActor func show(_ c: CGImage) { let t = Turn.image(c, q); image = NSImage(cgImage: t, size: NSSize(width: t.width, height: t.height)) }
             if let cg = await Task.detached(priority: .userInitiated, operation: { store.loadImage(cached) }).value {
-                image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)); return
+                show(cg); return
             }
             // 2. Crop of the 320 px thumbnail: enough unless the region is tiny in the photo.
-            if let thumb = await model.thumbs.load(f.mediaId), let cg = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil),
+            if let thumb = await model.thumbs.loadRaw(f.mediaId), let cg = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil),
                let c = Self.crop(cg, f, margin: margin) {
-                image = NSImage(cgImage: c, size: NSSize(width: c.width, height: c.height))
+                show(c)
                 if max(f.w * Double(cg.width), f.h * Double(cg.height)) >= 64 { store.store(c, at: cached); return }
             }
             // 3. Tiny: read the original once (a few at a time, the disk may be remote) and cache the crop.
@@ -670,7 +716,7 @@ struct RegionThumb: View {
             guard !Task.isCancelled, let big, let c = Self.crop(big, f, margin: margin) else { return }
             let small = Self.downscale(c, to: 256)
             store.store(small, at: cached)
-            image = NSImage(cgImage: small, size: NSSize(width: small.width, height: small.height))
+            show(small)
         }
     }
 
@@ -763,6 +809,8 @@ struct RegionEditor: View {
             }
         }
         .padding(14)
+        .onAppear { model.typing = true }
+        .onDisappear { model.typing = false }
         .task {
             if named { name = region.personName ?? "" }
             known = ((try? await model.library.owners(kind)) ?? []).map(\.name)
@@ -894,35 +942,42 @@ extension GridFrames {
     /// ticked in the filter bar) is drawn in colour, solid once a person confirmed it, dashed while
     /// it is only a suggestion or unnamed; the other faces / animals of the photo are thin and faint.
     static func identities(_ lib: Library, _ k: IdentityKind, owner: Int64? = nil,
-                           named: Bool = true, unnamed: Bool = true, ignored: Bool = false) -> GridFrames {
+                           named: Bool = true, unnamed: Bool = true, ignored: Bool = false, crop: Bool = false) -> GridFrames {
         let color: NSColor = k == .face ? .systemGreen : .systemOrange
         let id = "\(k.rawValue):\(owner.map(String.init) ?? "all"):\(named)\(unnamed)\(ignored)"
-        return GridFrames(id: id) { mediaId in
+        return GridFrames(id: id, load: { mediaId in
             let regions = (try? await lib.regions(k, mediaId: mediaId)) ?? []
             return regions.compactMap { r -> GridFrame? in
-                func f(_ c: NSColor, dashed: Bool, width: CGFloat = 2) -> GridFrame {
-                    GridFrame(x: r.x, y: r.y, w: r.w, h: r.h, color: c, dashed: dashed, width: width)
+                func f(_ c: NSColor, dashed: Bool, width: CGFloat = 2, target: Bool = false) -> GridFrame {
+                    GridFrame(x: r.x, y: r.y, w: r.w, h: r.h, color: c, dashed: dashed, width: width, target: target, regionId: r.id, kind: k)
                 }
                 if let o = owner {
-                    if r.personId == o { return f(color, dashed: false, width: 2.5) }
-                    if r.personId == nil && r.suggestedPersonId == o { return f(color, dashed: true, width: 2.5) }
+                    if r.personId == o { return f(color, dashed: false, width: 2.5, target: true) }
+                    if r.personId == nil && r.suggestedPersonId == o { return f(color, dashed: true, width: 2.5, target: true) }
                     return r.ignored ? nil : f(.white.withAlphaComponent(0.55), dashed: r.personId == nil, width: 1)
                 }
-                if r.ignored { return ignored ? f(.systemGray, dashed: true, width: 1.5) : nil }
-                if r.personId != nil { return named ? f(color, dashed: false) : f(.white.withAlphaComponent(0.55), dashed: false, width: 1) }
-                return unnamed ? f(.white, dashed: true) : f(.white.withAlphaComponent(0.55), dashed: true, width: 1)
+                if r.ignored { return ignored ? f(.systemGray, dashed: true, width: 1.5, target: true) : nil }
+                if r.personId != nil { return named ? f(color, dashed: false, target: true) : f(.white.withAlphaComponent(0.55), dashed: false, width: 1) }
+                return unnamed ? f(.white, dashed: true, target: true) : f(.white.withAlphaComponent(0.55), dashed: true, width: 1)
             }
-        }
+        }, crop: crop)
     }
 }
 
-/// "Frames" toggle shared by the photo grids of People, Animals and Labels (remembered).
+/// "Frames" and "Frame only" toggles shared by the photo grids of People, Animals and Labels (remembered).
 struct FramesToggle: View {
     @AppStorage("grid.showFrames") var on = true
+    @AppStorage("grid.frameOnly") var only = false
     var help = "Show face / animal frames on the thumbnails: coloured for the one shown here, solid when confirmed, dashed when not yet"
     var body: some View {
-        Toggle(isOn: $on) { Label("Frames", systemImage: "person.crop.square") }
-            .toggleStyle(.button).help(help)
+        HStack(spacing: 4) {
+            Toggle(isOn: $on) { Label("Frames", systemImage: "person.crop.square") }
+                .toggleStyle(.button).help(help)
+            Toggle(isOn: $only) { Label("Frame only", systemImage: "viewfinder") }
+                .toggleStyle(.button)
+                .help("Zoom each thumbnail on its face / animal: bigger, easier to decide")
+                .onChange(of: only) { if only { on = true } }
+        }
     }
 }
 
@@ -979,5 +1034,192 @@ struct DuplicatesSheet: View {
         }
         .padding(20)
         .frame(width: 620)
+    }
+}
+
+/// Shooting details read from the file's EXIF / TIFF / GPS metadata (only what is present).
+enum ExifDetails {
+    static func read(_ url: URL) -> [(String, String)] {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return [] }
+        let exif = p[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]
+        let tiff = p[kCGImagePropertyTIFFDictionary] as? [CFString: Any] ?? [:]
+        let gps = p[kCGImagePropertyGPSDictionary] as? [CFString: Any] ?? [:]
+        let aux = p[kCGImagePropertyExifAuxDictionary] as? [CFString: Any] ?? [:]
+        var out: [(String, String)] = []
+        // Finite values only: malformed EXIF (e.g. ExposureTime = 0, NaN) would otherwise trap on Int(...) conversions.
+        func num(_ v: Any?) -> Double? { (v as? NSNumber).map(\.doubleValue).flatMap { $0.isFinite ? $0 : nil } }
+        func int(_ d: Double) -> Int? { abs(d) < 1e15 ? Int(d) : nil }
+        if let make = tiff[kCGImagePropertyTIFFMake] as? String, let model = tiff[kCGImagePropertyTIFFModel] as? String {
+            out.append(("Camera", model.lowercased().hasPrefix(make.lowercased()) ? model : "\(make) \(model)"))
+        }
+        if let lens = (exif[kCGImagePropertyExifLensModel] as? String) ?? (aux[kCGImagePropertyExifAuxLensModel] as? String) { out.append(("Lens", lens)) }
+        var exposure: [String] = []
+        if let t = num(exif[kCGImagePropertyExifExposureTime]), t > 0 {
+            if t >= 1 { exposure.append(String(format: "%.1f s", t)) } else if let d = int((1 / t).rounded()) { exposure.append("1/\(d) s") }
+        }
+        if let f = num(exif[kCGImagePropertyExifFNumber]) { exposure.append(String(format: "ƒ/%.1f", f)) }
+        if let iso = (exif[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber])?.first { exposure.append("ISO \(iso)") }
+        if let b = num(exif[kCGImagePropertyExifExposureBiasValue]), b != 0 { exposure.append(String(format: "%+.1f EV", b)) }
+        if !exposure.isEmpty { out.append(("Exposure", exposure.joined(separator: " · "))) }
+        if let fl = num(exif[kCGImagePropertyExifFocalLength]) {
+            let eq = num(exif[kCGImagePropertyExifFocalLenIn35mmFilm]).map { String(format: " (%.0f mm eq.)", $0) } ?? ""
+            out.append(("Focal length", String(format: "%.1f mm", fl) + eq))
+        }
+        if let flash = num(exif[kCGImagePropertyExifFlash]).flatMap(int) { out.append(("Flash", flash & 1 == 1 ? "Fired" : "No flash")) }
+        if let wb = num(exif[kCGImagePropertyExifWhiteBalance]) { out.append(("White balance", wb == 0 ? "Auto" : "Manual")) }
+        let modes = [0: "Unknown", 1: "Average", 2: "Center-weighted", 3: "Spot", 4: "Multi-spot", 5: "Pattern", 6: "Partial"]
+        if let m = num(exif[kCGImagePropertyExifMeteringMode]).flatMap(int), let s = modes[m] { out.append(("Metering", s)) }
+        if let alt = num(gps[kCGImagePropertyGPSAltitude]) { out.append(("Altitude", String(format: "%.0f m", alt))) }
+        if let sw = tiff[kCGImagePropertyTIFFSoftware] as? String { out.append(("Software", sw)) }
+        if let d = exif[kCGImagePropertyExifDateTimeOriginal] as? String { out.append(("Original date", d)) }
+        if let cs = p[kCGImagePropertyProfileName] as? String { out.append(("Colour profile", cs)) }
+        if let dpi = num(p[kCGImagePropertyDPIWidth]).flatMap(int), dpi != 72 { out.append(("Resolution", "\(dpi) dpi")) }
+        return out
+    }
+}
+
+/// Shows a SwiftUI view in a popover anchored on an AppKit view (a grid cell), closed on click outside.
+@MainActor enum Popup {
+    static var current: NSPopover?
+    static func show<V: View>(_ content: V, model: AppModel, at view: NSView) {
+        current?.close()
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = NSHostingController(rootView: content.environmentObject(model))
+        pop.show(relativeTo: view.bounds, of: view, preferredEdge: .maxY)
+        current = pop
+    }
+    static func close() { current?.close(); current = nil }
+}
+
+/// Right-click on photos selected in a People / Animals grid: acts on the face / animal of each
+/// photo that the grid is about (the person's, or the largest one in the categories shown).
+struct PhotoRegionsActions: View {
+    @EnvironmentObject private var model: AppModel
+    let kind: IdentityKind
+    let mediaIds: [Int64]
+    /// A person's / pet's page: their face in each photo (confirmed or suggested).
+    var owner: PersonSummary? = nil
+    var named = true, unnamed = true, ignored = false
+    @State private var targets: [FaceRecord] = []
+    @State private var loaded = false
+    @State private var name = ""
+    @State private var known: [String] = []
+    @FocusState private var focused: Bool
+
+    var namedT: [FaceRecord] { targets.filter { $0.personId != nil && !$0.ignored } }
+    var suggestedT: [FaceRecord] { targets.filter { $0.personId == nil && !$0.ignored && $0.suggestedPersonId != nil } }
+    var unnamedT: [FaceRecord] { targets.filter { $0.personId == nil && !$0.ignored } }
+    var ignoredT: [FaceRecord] { targets.filter(\.ignored) }
+
+    var matches: [String] {
+        let q = name.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return Array(known.prefix(5)) }
+        return Array(known.filter { $0.localizedCaseInsensitiveContains(q) && $0.caseInsensitiveCompare(q) != .orderedSame }.prefix(5))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("\(mediaIds.count) photo\(mediaIds.count > 1 ? "s" : "") selected").font(.headline)
+            if !loaded {
+                ProgressView().controlSize(.small)
+            } else if targets.isEmpty {
+                Text("No \(kind.itemWord) to act on in these photos.").foregroundStyle(.secondary)
+            } else {
+                Text([namedT.isEmpty ? nil : "\(namedT.count) named", unnamedT.isEmpty ? nil : "\(unnamedT.count) unnamed",
+                      ignoredT.isEmpty ? nil : "\(ignoredT.count) ignored"].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    TextField(owner == nil ? "Name as…" : "Move to…", text: $name)
+                        .textFieldStyle(.roundedBorder).frame(width: 220).focused($focused)
+                        .onSubmit(nameAll)
+                        .onKeyPress(.tab) { if let m = matches.first { name = m; return .handled }; return .ignored }
+                    Button("OK", action: nameAll).keyboardShortcut(.defaultAction)
+                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if !matches.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(matches, id: \.self) { m in
+                            Button { name = m; nameAll() } label: { Label(m, systemImage: kind == .face ? "person" : "pawprint") }.buttonStyle(.plain)
+                        }
+                    }
+                }
+                Divider()
+                HStack {
+                    if let o = owner {
+                        let sug = suggestedT.filter { $0.suggestedPersonId == o.id }
+                        if !sug.isEmpty {
+                            Button { run { _ = try await $0.assign(kind, sug.map(\.id), to: o.id) } } label: { Label("Confirm \(sug.count)", systemImage: "checkmark") }
+                            Button { run { lib in for f in sug { _ = try await lib.reject(kind, owner: o.id, mediaIds: [f.mediaId]) } } } label: {
+                                Label("Reject \(sug.count)", systemImage: "xmark")
+                            }
+                        }
+                        let mine = namedT.filter { $0.personId == o.id }
+                        if !mine.isEmpty {
+                            Button(role: .destructive) { run { _ = try await $0.unassign(kind, mine.map(\.id)) } } label: {
+                                Label("Not \(o.name) (\(mine.count))", systemImage: "person.crop.circle.badge.xmark")
+                            }
+                        }
+                    } else {
+                        if !unnamedT.isEmpty {
+                            Button(role: .destructive) { run { _ = try await $0.setIgnored(kind, unnamedT.map(\.id), true) } } label: {
+                                Label("Ignore \(unnamedT.count)", systemImage: "eye.slash")
+                            }
+                        }
+                        if !ignoredT.isEmpty {
+                            Button { run { _ = try await $0.setIgnored(kind, ignoredT.map(\.id), false) } } label: {
+                                Label("Restore \(ignoredT.count)", systemImage: "arrow.uturn.backward")
+                            }
+                        }
+                    }
+                    Spacer()
+                    Button("Cancel") { Popup.close() }.keyboardShortcut(.cancelAction)
+                }
+            }
+        }
+        .padding(14)
+        .frame(minWidth: 340)
+        .onAppear { model.typing = true }
+        .onDisappear { model.typing = false }
+        .task {
+            known = ((try? await model.library.owners(kind)) ?? []).map(\.name)
+            await pickTargets()
+            focused = true
+        }
+    }
+
+    /// One face / animal per photo: the owner's (confirmed or suggested), or the largest one in the
+    /// categories shown.
+    func pickTargets() async {
+        var out: [FaceRecord] = []
+        for m in mediaIds.prefix(500) {
+            let rs = (try? await model.library.regions(kind, mediaId: m)) ?? []
+            let candidates = rs.filter { r in
+                if let o = owner { return r.personId == o.id || (r.personId == nil && !r.ignored && r.suggestedPersonId == o.id) }
+                if r.ignored { return ignored }
+                return r.personId != nil ? named : unnamed
+            }
+            if let best = candidates.max(by: { $0.w * $0.h < $1.w * $1.h }) { out.append(best) }
+        }
+        targets = out
+        loaded = true
+    }
+
+    /// One name for all: named ones that had another name are taken from it first (remembered as wrong).
+    func nameAll() {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        let (k, all) = (kind, targets)
+        run { lib in
+            let renamed = all.filter { $0.personId != nil }.map(\.id)
+            if !renamed.isEmpty { _ = try await lib.unassign(k, renamed) }
+            _ = try await lib.nameItems(k, all.map(\.id), name: n)
+        }
+    }
+
+    func run(_ body: @escaping @Sendable (Library) async throws -> Void) {
+        Popup.close()
+        Task { await model.identityEdit(kind, body) }
     }
 }

@@ -21,6 +21,14 @@ extension Library {
          DateComponents(calendar: .current, year: y + 1).date!.timeIntervalSince1970)
     }
 
+    /// Photos shown in the library (what the grids list): counts and groups use the same set, so a
+    /// card's numbers match its lists — hidden copies, ignored and unindexed files are left out.
+    static let visibleMedia = "m.ignored = 0 AND m.hidden = 0 AND m.dup_of IS NULL AND m.meta_state = 1 AND m.thumb_state = 1"
+
+    /// Regions of photos that are not hidden copies: a copy shares its kept photo's decisions, so the
+    /// suggestion engine reads each picture once (no suggestions for copies, no doubled examples).
+    static let notCopy = "media_id NOT IN (SELECT id FROM media WHERE dup_of IS NOT NULL)"
+
     func yearClause(_ year: Int?, column: String = "m.taken_at") -> (String, [SQLBindable]) {
         guard let year else { return ("", []) }
         let (a, b) = Self.yearRange(year)
@@ -35,9 +43,13 @@ extension Library {
         return try db.all("""
             SELECT * FROM (
               SELECT p.id, p.name,
-                (SELECT count(*) FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) = p.id AND t.ignored = 0\(yc)) n,
-                (SELECT count(*) FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) IS NULL AND t.\(k.suggested) = p.id AND t.ignored = 0\(yc)) s,
-                (SELECT t.id FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) = p.id\(yc) ORDER BY t.w DESC LIMIT 1)
+                (SELECT count(DISTINCT t.media_id) FROM \(t) t JOIN media m ON m.id = t.media_id
+                 WHERE t.\(k.col) = p.id AND t.ignored = 0 AND \(Self.visibleMedia)\(yc)) n,
+                (SELECT count(DISTINCT t.media_id) FROM \(t) t JOIN media m ON m.id = t.media_id
+                 WHERE t.\(k.col) IS NULL AND t.\(k.suggested) = p.id AND t.ignored = 0 AND \(Self.visibleMedia)\(yc)) s,
+                coalesce((SELECT t.id FROM \(t) t WHERE t.id = p.cover_id AND t.\(k.col) = p.id),
+                         (SELECT t.id FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) = p.id AND \(Self.visibleMedia)\(yc)
+                          ORDER BY coalesce(m.aesthetic, 0) DESC, t.w DESC LIMIT 1))
               FROM \(k.owners) p WHERE p.name != '' AND p.merged_into IS NULL)
             WHERE n > 0 OR s > 0 ORDER BY n DESC
             """, ya + ya + ya) {
@@ -54,7 +66,7 @@ extension Library {
         var items: [(id: Int64, print: [Float]?)] = []
         try db.query("""
             SELECT t.id, t.print FROM \(k.table) t JOIN media m ON m.id = t.media_id
-            WHERE t.\(k.col) IS NULL AND t.ignored = ? \(ignored ? "" : "AND t.\(k.suggested) IS NULL") AND m.ignored = 0\(yc)
+            WHERE t.\(k.col) IS NULL AND t.ignored = ? \(ignored ? "" : "AND t.\(k.suggested) IS NULL") AND \(Self.visibleMedia)\(yc)
             ORDER BY t.w * t.h DESC LIMIT ?
             """, [ignored ? 1 : 0] + ya + [maxItems]) { r in
             items.append((r.int(0), r.blob(1).map { d in d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }))
@@ -87,7 +99,7 @@ extension Library {
         return try db.all("""
             SELECT coalesce(sum(t.\(k.col) IS NOT NULL AND t.ignored = 0), 0), coalesce(sum(t.\(k.col) IS NULL AND t.ignored = 0), 0),
                    coalesce(sum(t.ignored), 0)
-            FROM \(k.table) t JOIN media m ON m.id = t.media_id WHERE m.ignored = 0\(yc)
+            FROM \(k.table) t JOIN media m ON m.id = t.media_id WHERE \(Self.visibleMedia)\(yc)
             """, ya) { (Int($0.int(0)), Int($0.int(1)), Int($0.int(2))) }.first ?? (0, 0, 0)
     }
 
@@ -165,10 +177,96 @@ extension Library {
         return n
     }
 
+    /// The face / animal shown on a person's / pet's card (default: the one in their best-looking photo).
+    public func setCover(_ k: IdentityKind, owner: Int64, region: Int64?) throws {
+        try db.run("UPDATE \(k.owners) SET cover_id = ? WHERE id = ?", region, owner)
+    }
+
     public func renameOwner(_ k: IdentityKind, _ id: Int64, to name: String) throws {
         let n = name.trimmingCharacters(in: .whitespaces)
         guard !n.isEmpty else { return }
         try db.run("UPDATE \(k.owners) SET name = ? WHERE id = ?", n, id)
+    }
+
+    /// Hidden copies (identical files, the same picture resized) and the photo kept share their
+    /// decisions: each face / animal on a copy is paired with the nearest one of about the same size
+    /// on the kept photo, and the pair takes the latest human decision made on either side (name,
+    /// ignore, rejection — undoing one included), else the kept photo's, else a name found on a copy
+    /// (e.g. imported from Picasa in the copy's folder). Copies get no suggestions of their own.
+    /// `since`: only the groups with a decision made since then (after an edit); nil: all of them
+    /// (after grouping, after an import). Returns the regions changed.
+    @discardableResult
+    public func mirrorToCopies(_ k: IdentityKind, since: Double? = nil) throws -> Int {
+        struct Region {
+            let id: Int64, keep: Int64, media: Int64, copy: Bool, x, y, w, h: Double
+            let owner: Int64?, rejected: Int64?, ignored: Bool, human: Bool, at: Double?, suggested: Bool
+            var state: [Int64?] { [owner, rejected, ignored ? 1 : 0, human ? 1 : 0] }
+        }
+        let t = k.table
+        let scope = since == nil ? "" : """
+             AND coalesce(m.dup_of, m.id) IN (SELECT coalesce(m2.dup_of, m2.id) FROM \(t) t2 JOIN media m2 ON m2.id = t2.media_id WHERE t2.human_at >= ?)
+            """
+        return try db.transaction {
+            let rows = try db.all("""
+                SELECT t.id, coalesce(m.dup_of, m.id), m.id, m.dup_of IS NOT NULL, t.x, t.y, t.w, t.h,
+                       t.\(k.col), t.\(k.rejected), t.ignored, t.human, t.human_at, t.\(k.suggested) IS NOT NULL
+                FROM \(t) t JOIN media m ON m.id = t.media_id
+                WHERE (m.dup_of IS NOT NULL OR m.id IN (SELECT dup_of FROM media WHERE dup_of IS NOT NULL))\(scope)
+                """, since.map { [$0] } ?? []) {
+                Region(id: $0.int(0), keep: $0.int(1), media: $0.int(2), copy: $0.int(3) != 0,
+                       x: $0.double(4), y: $0.double(5), w: $0.double(6), h: $0.double(7),
+                       owner: $0.optInt(8), rejected: $0.optInt(9), ignored: $0.int(10) != 0, human: $0.int(11) != 0,
+                       at: $0.optDouble(12), suggested: $0.int(13) != 0)
+            }
+            var n = 0
+            var written = Set<Int64>()
+            // Copies lose any suggestion; the kept photo keeps its own unless it is now named,
+            // ignored, or rejected for that name.
+            func write(_ r: Region, from s: Region) throws {
+                guard r.state != s.state || r.at != s.at || (r.copy && r.suggested) else { return }
+                try db.run("""
+                    UPDATE \(t) SET \(k.col) = ?, \(k.rejected) = ?, ignored = ?, human = ?, human_at = ?,
+                      \(k.suggested) = CASE WHEN ? OR \(k.suggested) IS ? THEN NULL ELSE \(k.suggested) END WHERE id = ?
+                    """, s.owner, s.rejected, s.ignored, s.human, s.at, r.copy || s.owner != nil || s.ignored, s.rejected, r.id)
+                written.insert(r.id)
+                n += 1
+            }
+            for (_, group) in Dictionary(grouping: rows, by: \.keep) {
+                let kept = group.filter { !$0.copy }
+                // Pairs: per copy, nearest first, each region used once; same place = centres closer
+                // than a quarter of the region's width, widths within 25 %.
+                var pairs: [Int64: [Region]] = [:] // kept region → its copies' regions
+                for (_, regions) in Dictionary(grouping: group.filter(\.copy), by: \.media) {
+                    var cands: [(d: Double, c: Region, o: Region)] = []
+                    for c in regions {
+                        for o in kept {
+                            let size = max(c.w, o.w), d = hypot(c.x + c.w / 2 - o.x - o.w / 2, c.y + c.h / 2 - o.y - o.h / 2)
+                            if d < size / 4, abs(c.w - o.w) < size / 4 { cands.append((d, c, o)) }
+                        }
+                    }
+                    var used = Set<Int64>()
+                    for p in cands.sorted(by: { $0.d < $1.d }) where !used.contains(p.c.id) && !used.contains(p.o.id) {
+                        used.insert(p.c.id); used.insert(p.o.id)
+                        pairs[p.o.id, default: []].append(p.c)
+                    }
+                }
+                for o in kept {
+                    guard let copies = pairs[o.id] else { continue }
+                    let all = [o] + copies
+                    // The latest human decision (the kept photo on a tie), else the kept one's, else a copy's name.
+                    let source = all.filter(\.human).max { ($0.at ?? 0, $0.copy ? 0 : 1) < ($1.at ?? 0, $1.copy ? 0 : 1) }
+                        ?? ((o.owner != nil || o.ignored || o.rejected != nil) ? o : nil)
+                        ?? copies.first { $0.owner != nil && !$0.ignored }
+                    if let s = source { for r in all where r.id != s.id { try write(r, from: s) } }
+                }
+                // Copies' regions not rewritten above (no counterpart, no decision): no suggestion either.
+                for c in group where c.copy && c.suggested && !written.contains(c.id) {
+                    try db.run("UPDATE \(t) SET \(k.suggested) = NULL WHERE id = ?", c.id)
+                    n += 1
+                }
+            }
+            return n
+        }
     }
 
     /// Ignores (or restores) unnamed items: ignored ones are never suggested nor grouped with the
@@ -280,7 +378,7 @@ extension Library {
     func centroids(_ k: IdentityKind) throws -> (persons: [Int64], centroids: [Float], dim: Int) {
         var sums: [Int64: [Float]] = [:]
         var dim = 0
-        try db.query("SELECT \(k.col), print FROM \(k.table) WHERE \(k.col) IS NOT NULL AND print IS NOT NULL") { r in
+        try db.query("SELECT \(k.col), print FROM \(k.table) WHERE \(k.col) IS NOT NULL AND print IS NOT NULL AND \(Self.notCopy)") { r in
             guard let d = r.blob(1) else { return }
             let v = d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
             guard !v.isEmpty else { return } // animal crop that gave no print
@@ -301,14 +399,15 @@ extension Library {
 
     /// Faces / animals a human said are not someone (rejected suggestion, or taken away), with their print.
     func counterExamples(_ k: IdentityKind, dim: Int) throws -> [(owner: Int64, print: [Float])] {
-        try db.all("SELECT \(k.rejected), print FROM \(k.table) WHERE \(k.rejected) IS NOT NULL AND print IS NOT NULL") { r in
+        try db.all("SELECT \(k.rejected), print FROM \(k.table) WHERE \(k.rejected) IS NOT NULL AND print IS NOT NULL AND \(Self.notCopy)") { r in
             (r.int(0), r.blob(1).map { $0.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } } ?? [])
         }.filter { $0.print.count == dim }
     }
 
     func unnamedPrints(_ k: IdentityKind, after: Int64, limit: Int, dim: Int) throws -> [(id: Int64, print: [Float], rejected: Int64?)] {
         try db.all("""
-            SELECT id, print, \(k.rejected) FROM \(k.table) WHERE \(k.col) IS NULL AND ignored = 0 AND print IS NOT NULL AND id > ? ORDER BY id LIMIT ?
+            SELECT id, print, \(k.rejected) FROM \(k.table) WHERE \(k.col) IS NULL AND ignored = 0 AND print IS NOT NULL AND id > ?
+              AND \(Self.notCopy) ORDER BY id LIMIT ?
             """, [after, limit]) { r in
             (r.int(0), r.blob(1).map { $0.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } } ?? [], r.optInt(2))
         }.filter { $0.print.count == dim }
@@ -317,7 +416,8 @@ extension Library {
     /// Paging cursor independent of the dim filter (so a batch of wrong-sized prints cannot end the loop early).
     func lastUnnamedPrintId(_ k: IdentityKind, after: Int64, limit: Int) throws -> Int64? {
         try db.scalar("""
-            SELECT max(id) FROM (SELECT id FROM \(k.table) WHERE \(k.col) IS NULL AND ignored = 0 AND print IS NOT NULL AND id > ? ORDER BY id LIMIT ?)
+            SELECT max(id) FROM (SELECT id FROM \(k.table) WHERE \(k.col) IS NULL AND ignored = 0 AND print IS NOT NULL AND id > ?
+              AND \(Self.notCopy) ORDER BY id LIMIT ?)
             """, [after, limit])
     }
 

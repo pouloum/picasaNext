@@ -310,6 +310,9 @@ extension Library {
             // Group dates (newest photo), for ordering the covers.
             try db.run("UPDATE group_info SET taken = (SELECT max(m.taken_at) FROM media m WHERE m.id = group_info.cover_id)")
         }
+        // Copies take the names and decisions of the photo kept.
+        try mirrorToCopies(.face)
+        try mirrorToCopies(.pet)
         return rep
     }
 

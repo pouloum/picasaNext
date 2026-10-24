@@ -84,8 +84,15 @@ struct RootView: View {
                         LastScanStatus().frame(width: slot)
                         CountStatus().frame(width: slot)
                         JobStatus().frame(width: slot)
-                        Button { model.addFolder() } label: { Label("Add Folder", systemImage: "folder.badge.plus") }
-                            .labelStyle(.iconOnly).help("Add Folder to Library… (⌘O)").frame(width: slot)
+                        HStack(spacing: 14) {
+                            Button { model.revealInFinder() } label: { Label("Show in Finder", systemImage: "folder") }
+                                .labelStyle(.iconOnly).disabled(!model.canReveal)
+                                .help("Show in Finder: the selected photos, or the folder shown (⇧⌘R)")
+                                .keyboardShortcut("r", modifiers: [.command, .shift])
+                            Button { model.addFolder() } label: { Label("Add Folder", systemImage: "folder.badge.plus") }
+                                .labelStyle(.iconOnly).help("Add Folder to Library… (⌘O)")
+                        }
+                        .frame(width: slot)
                     }
                     .lineLimit(1)
                 }
@@ -221,12 +228,16 @@ struct Sidebar: View {
     /// sidebar loses focus (the system highlight then fades to light grey).
     /// The tag must stay the outermost modifier: a badge or help applied after it hid the tag from
     /// the List, and the row could no longer be selected.
-    func row(_ title: String, _ icon: String, _ tag: SidebarItem, badge: Int = 0, help: String = "", dim: Bool = false) -> some View {
+    func row(_ title: String, _ icon: String, _ tag: SidebarItem, badge: Int = 0, help: String = "", dim: Bool = false,
+             reveal: String? = nil) -> some View {
         let on = selection == tag
         return Label { Text(title).fontWeight(on ? .semibold : .regular) } icon: { Image(systemName: icon).symbolVariant(on ? .fill : .none) }
             .foregroundStyle(dim ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
             .badge(badge)
             .help(help)
+            .contextMenu {
+                if let reveal { Button("Show in Finder") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: reveal) } }
+            }
             .tag(tag)
     }
 
@@ -272,13 +283,15 @@ struct Sidebar: View {
             if !model.years.isEmpty {
                 Section("Years") {
                     ForEach(model.years, id: \.year) { y in
-                        row(String(y.year), "calendar", SidebarItem.filter(.year(y.year), String(y.year)), badge: y.count)
+                        let title = y.year == 0 ? "No date" : String(y.year)
+                        row(title, y.year == 0 ? "calendar.badge.exclamationmark" : "calendar", SidebarItem.filter(.year(y.year), title), badge: y.count,
+                            help: y.year == 0 ? "No date in the photo, or a date in the future (camera clock never set). Set one in the viewer's info panel." : "")
                     }
                 }
             }
             Section("Folders") {
                 ForEach(model.folders) { f in
-                    row(f.title, "folder", SidebarItem.filter(.folder(f.id), f.title), badge: f.count, help: f.path)
+                    row(f.title, "folder", SidebarItem.filter(.folder(f.id), f.title), badge: f.count, help: f.path, reveal: f.path)
                 }
             }
         }
@@ -305,6 +318,7 @@ struct GridView: View {
         } else {
             VStack(spacing: 0) {
                 YearGrid(ids: model.ids, sections: model.sections, cellSize: size, resetKey: model.currentFilter,
+                         onSelect: { sel in model.gridSelection = sel.compactMap { $0 < model.ids.count ? model.ids[$0] : nil } },
                          badges: model.groups.isEmpty ? [:] : model.groupBadges, expanded: model.expanded,
                          members: model.groups.isEmpty ? [] : model.expandedMembers,
                          onBadge: model.groups.isEmpty ? nil : { model.toggleGroup($0) })
@@ -394,14 +408,15 @@ struct ViewerView: View {
                 }
                 .clipped()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                InfoPanel(item: item, faces: faces, tags: tags, scene: scene)
+                InfoPanel(item: item, faces: faces, pets: pets, tags: tags, scene: scene)
             }
         }
         .focusable()
         .focusEffectDisabled()
         .focused($focused)
-        .onKeyPress(.space) { close(); return .handled }
+        .onKeyPress(.space) { guard !model.typing else { return .ignored }; close(); return .handled }
         .onKeyPress(.return) {
+            guard !model.typing else { return .ignored }
             guard item?.kind == .video else { return .ignored }
             togglePlay()
             return .handled
@@ -457,9 +472,9 @@ struct ViewerView: View {
     var controls: some View {
         HStack(spacing: 12) {
             Button { step(-1) } label: { Image(systemName: "chevron.left") }
-                .keyboardShortcut(.leftArrow, modifiers: []).help("Previous (←)")
+                .oneKey(.leftArrow, active: !model.typing).help("Previous (←)")
             Button { step(1) } label: { Image(systemName: "chevron.right") }
-                .keyboardShortcut(.rightArrow, modifiers: []).help("Next (→)")
+                .oneKey(.rightArrow, active: !model.typing).help("Next (→)")
             Text(item?.name ?? " ").font(.headline).lineLimit(1).truncationMode(.middle)
             Spacer()
             if zoom > 1 {
@@ -471,26 +486,31 @@ struct ViewerView: View {
             }
             Toggle(isOn: $showFaces) { Image(systemName: "person.crop.square") }
                 .toggleStyle(.button).help("Show face and pet frames with their names (click one to name it)")
+            Button { rotate(-1) } label: { Image(systemName: "rotate.left") }.oneKey("[", active: !model.typing).help("Rotate left ([)")
+            Button { rotate(1) } label: { Image(systemName: "rotate.right") }.oneKey("]", active: !model.typing).help("Rotate right (])")
             Button { if let item { Task { await model.toggleStar(item); await load() } } } label: {
                 Image(systemName: item?.star == true ? "star.fill" : "star")
             }
-            .keyboardShortcut("s", modifiers: []).help("Star (S)").disabled(item == nil)
+            .oneKey("s", active: !model.typing).help("Star (S)").disabled(item == nil)
             Button { if let item { NSWorkspace.shared.activateFileViewerSelecting([item.url]) } } label: { Image(systemName: "folder") }
                 .help("Show in Finder").disabled(item == nil)
             Button { NSApp.keyWindow?.toggleFullScreen(nil) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
-                .keyboardShortcut("f", modifiers: []).help("Full screen (F)")
-            Button("Close") { close() }.keyboardShortcut(.escape, modifiers: [])
+                .oneKey("f", active: !model.typing).help("Full screen (F)")
+            Button("Close") { close() }.oneKey(.escape, active: !model.typing)
             // Space closes like Quick Look, photos and videos alike; Return plays/pauses a video.
-            Button("") { close() }.keyboardShortcut(.space, modifiers: [])
+            Button("") { close() }.oneKey(.space, active: !model.typing)
                 .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
-            Button("") { togglePlay() }.keyboardShortcut(.return, modifiers: [])
+            Button("") { togglePlay() }.oneKey(.return, active: !model.typing)
                 .disabled(item?.kind != .video).opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .frame(height: 44)
     }
 
-    func faceBox(_ f: FaceRecord, kind: IdentityKind, in size: CGSize) -> some View {
+    func faceBox(_ f0: FaceRecord, kind: IdentityKind, in size: CGSize) -> some View {
+        // Boxes are stored for the unturned picture: turn them like the photo.
+        let (bx, by, bw, bh) = Turn.rect(f0.x, f0.y, f0.w, f0.h, item?.rotate ?? 0)
+        let f = (x: bx, y: by, w: bw, h: bh, personId: f0.personId, suggestedPersonId: f0.suggestedPersonId, personName: f0.personName, id: f0.id)
         let named = f.personId != nil
         let suggested = !named && f.suggestedPersonId != nil
         let color: Color = kind == .pet ? (named ? .orange : suggested ? .yellow : .white.opacity(0.8)) : (named ? .green : (suggested ? .yellow : .white))
@@ -507,7 +527,7 @@ struct ViewerView: View {
         .offset(x: f.x * size.width, y: f.y * size.height)
         .onTapGesture { editing = key }
         .popover(isPresented: Binding(get: { editing == key }, set: { if !$0, editing == key { editing = nil } }), arrowEdge: .bottom) {
-            RegionEditor(kind: kind, region: f) {
+            RegionEditor(kind: kind, region: f0) {
                 editing = nil
                 Task { try? await Task.sleep(for: .milliseconds(400)); await loadInfo() }
             }
@@ -519,6 +539,17 @@ struct ViewerView: View {
             }
         }
         .help(named ? "Rename" : suggested ? "Confirm or reject this suggestion" : "Name this \(kind.itemWord) (right-click to ignore)")
+    }
+
+    /// Turns the photo (stored in the library, the file is untouched); grids follow.
+    func rotate(_ q: Int) {
+        guard let item, item.kind != .video else { return }
+        Task {
+            await model.rotate([item.id], by: q)
+            fullResLoaded = false
+            full = nil
+            await load()
+        }
     }
 
     func togglePlay() {
@@ -547,7 +578,8 @@ struct ViewerView: View {
         guard let item, !fullResLoaded else { return }
         let px = Int((NSScreen.main?.frame.width ?? 2560) * (NSScreen.main?.backingScaleFactor ?? 2))
         let url = item.url
-        if let cg = await Task.detached(priority: .userInitiated, operation: { ThumbnailStore.imageThumbnail(url, maxPixel: px) }).value,
+        let q = item.rotate
+        if let cg = await Task.detached(priority: .userInitiated, operation: { ThumbnailStore.imageThumbnail(url, maxPixel: px).map { Turn.image($0, q) } }).value,
            model.viewing == v, !fullResLoaded {
             full = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         }
@@ -582,7 +614,8 @@ struct ViewerView: View {
         fullResLoaded = true
         let px = min(12_000, max(item.width ?? 0, item.height ?? 0, 4000))
         let url = item.url
-        if let cg = await Task.detached(priority: .userInitiated, operation: { ThumbnailStore.imageThumbnail(url, maxPixel: px) }).value,
+        let q = item.rotate
+        if let cg = await Task.detached(priority: .userInitiated, operation: { ThumbnailStore.imageThumbnail(url, maxPixel: px).map { Turn.image($0, q) } }).value,
            model.viewing == v {
             full = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
         }
@@ -592,8 +625,13 @@ struct ViewerView: View {
 struct InfoPanel: View {
     @EnvironmentObject private var model: AppModel
     @State private var copies: [String] = []
+    @State private var exif: [(String, String)] = []
+    @State private var editingDate = false
+    @State private var placeName: String?
+    @State private var newDate = Date()
     let item: MediaItem?
     let faces: [FaceRecord]
+    var pets: [FaceRecord] = []
     let tags: [String]
     let scene: Library.SceneInfo?
 
@@ -612,50 +650,120 @@ struct InfoPanel: View {
                                 ForEach(copies.prefix(5), id: \.self) { Text($0).font(.caption).lineLimit(1).truncationMode(.head) }
                                 if copies.count > 5 { Text("+ \(copies.count - 5) more").font(.caption).foregroundStyle(.secondary) }
                             }
+                        }
+                    }
                 }
                 Section("Picture") {
-                    if let t = item.takenAt {
-                        LabeledContent("Taken") {
-                            VStack(alignment: .trailing, spacing: 1) {
-                                Text(t.formatted(date: .long, time: .shortened))
-                                if let src = item.dateSource, src != .metadata {
-                                    Label("Estimated from the \(src.label)", systemImage: "exclamationmark.triangle")
-                                        .font(.caption).foregroundStyle(.orange)
-                                        .help("The photo has no date of its own; this one comes from its \(src.label).")
-                                }
+                    LabeledContent("Taken") {
+                        VStack(alignment: .trailing, spacing: 1) {
+                            HStack(spacing: 4) {
+                                Text(item.takenAt.map { $0.timeIntervalSinceNow > 2 * 86400 ? "No date (\($0.formatted(date: .abbreviated, time: .omitted)))" : $0.formatted(date: .long, time: .shortened) } ?? "No date")
+                                Button { newDate = item.takenAt ?? Date(); editingDate = true } label: { Image(systemName: "pencil") }
+                                    .buttonStyle(.borderless).help("Change the date the photo was taken")
+                                    .popover(isPresented: $editingDate, arrowEdge: .leading) { dateEditor(item) }
+                            }
+                            if let src = item.dateSource, src == .manual {
+                                Label("Set by hand", systemImage: "hand.point.up.left").font(.caption).foregroundStyle(.secondary)
+                            } else if let src = item.dateSource, src != .metadata {
+                                Label("Estimated from the \(src.label)", systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(.orange)
+                                    .help("The photo has no date of its own; this one comes from its \(src.label).")
                             }
                         }
                     }
                     if let c = item.camera { LabeledContent("Camera", value: c) }
                     if let lat = item.lat, let lon = item.lon {
                         LabeledContent("Place") {
-                            Link(String(format: "%.5f, %.5f", lat, lon), destination: URL(string: "https://maps.apple.com/?ll=\(lat),\(lon)")!)
+                            VStack(alignment: .trailing, spacing: 1) {
+                                if let n = placeName { Text(n) }
+                                Button(String(format: "%.5f, %.5f", lat, lon)) {
+                                    model.go(to: .places, place: GeoPoint(id: item.id, lat: lat, lon: lon, score: 0))
+                                }
+                                .buttonStyle(.link).help("Show on the map (Places)")
+                            }
                         }
                     }
                     if let c = item.caption { LabeledContent("Caption", value: c) }
-                    if !tags.isEmpty { LabeledContent("Tags", value: tags.joined(separator: ", ")) }
-                    let people = faces.compactMap { $0.personId != nil ? $0.personName : nil }
-                    if !people.isEmpty { LabeledContent("People", value: Array(Set(people)).sorted().joined(separator: ", ")) }
+                    if !tags.isEmpty { LabeledContent("Tags") { links(tags.map { ($0, $0) }) { model.go(to: .labels, label: $0) } } }
+                    // People and pets: each name opens their page.
+                    let people = Dictionary(faces.compactMap { f in f.personId.flatMap { id in f.personName.map { (id, $0) } } }, uniquingKeysWith: { a, _ in a })
+                    if !people.isEmpty {
+                        LabeledContent("People") {
+                            links(people.sorted { $0.value < $1.value }.map { (String($0.key), $0.value) }) { id in
+                                if let i = Int64(id) { model.go(to: .people, owner: .init(kind: .face, id: i)) }
+                            }
+                        }
+                    }
+                    let named = Dictionary(pets.compactMap { f in f.personId.flatMap { id in f.personName.map { (id, $0) } } }, uniquingKeysWith: { a, _ in a })
+                    if !named.isEmpty {
+                        LabeledContent("Pets") {
+                            links(named.sorted { $0.value < $1.value }.map { (String($0.key), $0.value) }) { id in
+                                if let i = Int64(id) { model.go(to: .pets, owner: .init(kind: .pet, id: i)) }
+                            }
+                        }
+                    }
+                }
+                if !exif.isEmpty {
+                    Section("Shooting") {
+                        ForEach(exif, id: \.0) { k, v in LabeledContent(k, value: v) }
+                    }
                 }
                 if let scene, !(scene.labels.isEmpty && scene.animals.isEmpty && scene.aesthetic == nil) {
                     Section("Detected") {
-                        if !scene.animals.isEmpty { LabeledContent("Animals", value: Array(Set(scene.animals)).sorted().joined(separator: ", ")) }
-                        if !scene.labels.isEmpty { LabeledContent("Labels", value: scene.labels.prefix(10).joined(separator: ", ")) }
+                        if !scene.animals.isEmpty {
+                            LabeledContent("Animals") { links(Array(Set(scene.animals)).sorted().map { ($0, $0) }) { model.go(to: .labels, label: $0) } }
+                        }
+                        if !scene.labels.isEmpty {
+                            LabeledContent("Labels") {
+                                links(scene.labels.prefix(10).map { ($0, LabelSummary.display($0)) }) { model.go(to: .labels, label: $0) }
+                            }
+                        }
                         if let a = scene.aesthetic { LabeledContent("Aesthetics", value: String(format: "%.2f", a) + (scene.utility ? " · document/screenshot" : "")) }
                         if scene.similarCount > 0 { LabeledContent("Similar", value: "\(scene.similarCount) other photo\(scene.similarCount > 1 ? "s" : "")") }
                         if scene.burstCount > 0 { LabeledContent("Burst", value: "\(scene.burstCount) shots") }
-                            }
-                        }
                     }
                 }
             }
         }
         .task(id: item?.id) {
-            guard let id = item?.id else { copies = []; return }
+            guard let id = item?.id, let url = item?.url else { copies = []; exif = []; return }
             copies = (try? await model.library.copies(of: id)) ?? []
+            placeName = nil
+            if let lat = item?.lat, let lon = item?.lon { placeName = try? await model.library.placeName(lat: lat, lon: lon) }
+            exif = item?.kind == .video ? [] : await Task.detached(priority: .utility) { ExifDetails.read(url) }.value
         }
         .formStyle(.grouped)
         .frame(width: 300)
+    }
+
+    /// Clickable values (key, title), wrapped on several lines.
+    func links(_ items: [(String, String)], _ open: @escaping (String) -> Void) -> some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            ForEach(items, id: \.0) { key, title in
+                Button(title) { open(key) }.buttonStyle(.link)
+            }
+        }
+    }
+
+    func dateEditor(_ item: MediaItem) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Date taken").font(.headline)
+            DatePicker("", selection: $newDate, displayedComponents: [.date, .hourAndMinute])
+                .datePickerStyle(.field).labelsHidden()
+            HStack {
+                Spacer()
+                Button("Cancel") { editingDate = false }.keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    let (id, d) = (item.id, newDate)
+                    editingDate = false
+                    Task { try? await model.library.setTakenDate([id], d); await model.refreshAll() }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14).frame(width: 260)
+        .onAppear { model.typing = true }
+        .onDisappear { model.typing = false }
     }
 }
 
@@ -727,6 +835,7 @@ final class KeyedPlayerView: AVPlayerView {
 struct LabelsView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("grid.showFrames") private var showFrames = true
+    @AppStorage("grid.frameOnly") private var frameOnly = false
     static let animalLabels: Set<String> = ["cat", "dog", "animal", "pet", "kitten", "puppy", "feline", "canine", "mammal"]
     @State private var labels: [LabelSummary] = []
     @State private var selected: LabelSummary?
@@ -748,7 +857,7 @@ struct LabelsView: View {
                         }
                     }.padding(10)
                     YearGrid(ids: rows.map(\.id), sections: GridSection.byYear(rows.map(\.year)), resetKey: l.label,
-                             frames: showFrames && Self.animalLabels.contains(l.label.lowercased()) ? .identities(model.library, .pet) : nil)
+                             frames: showFrames && Self.animalLabels.contains(l.label.lowercased()) ? .identities(model.library, .pet, crop: frameOnly) : nil)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .task(id: [l.label, String(model.revision)]) { rows = (try? await model.library.mediaIdsAndYears(.label(l.label))) ?? [] }
@@ -773,7 +882,18 @@ struct LabelsView: View {
                 }
             }
         }
-        .task(id: model.revision) { labels = (try? await model.library.labelSummaries()) ?? []; loading = false }
+        .task(id: model.revision) { labels = (try? await model.library.labelSummaries()) ?? []; loading = false; openRequested() }
+        .onChange(of: model.openLabel) { openRequested() }
+    }
+}
+
+extension LabelsView {
+    /// A link (info panel) asked for a label: open its card, or search it if it has none.
+    func openRequested() {
+        guard let want = model.openLabel, !labels.isEmpty || !loading else { return }
+        model.openLabel = nil
+        if let l = labels.first(where: { $0.label.caseInsensitiveCompare(want) == .orderedSame }) { selected = l }
+        else { model.setQuery(tokens: [.label(want)], text: "") }
     }
 }
 
@@ -797,5 +917,12 @@ struct CoverThumb: View {
             image = await model.thumbs.load(mediaId)
             shown = mediaId
         }
+    }
+}
+
+extension View {
+    /// A shortcut on a single key (no modifier), switched off while typing in a popup.
+    @ViewBuilder func oneKey(_ key: KeyEquivalent, active: Bool) -> some View {
+        if active { keyboardShortcut(key, modifiers: []) } else { self }
     }
 }

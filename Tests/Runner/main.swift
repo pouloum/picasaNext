@@ -375,6 +375,105 @@ do {
     _ = try await lib.mergeDuplicates(.face, dups)
     let leftDups = try await lib.duplicateOwners(.face)
     check(leftDups.isEmpty, "duplicates merged")
+    // Rotation (quarter turns, wraps), manual date, future dates sorted as "No date" at the end.
+    try await lib.rotate([mid], by: -1)
+    let rot = try await lib.rotations()[mid]
+    check(rot == 3, "rotate left from 0 is 3 quarter turns: \(String(describing: rot))")
+    try await lib.rotate([mid], by: 1)
+    let rot0 = try await lib.rotations()[mid]
+    check(rot0 == nil, "back to no rotation")
+    let when = DateComponents(calendar: .current, year: 2012, month: 7, day: 14).date!
+    try await lib.setTakenDate([mid], when)
+    let dated = try await lib.items(ids: [mid]).first
+    check(dated?.takenAt == when && dated?.dateSource == .manual, "date set by hand")
+    let future = try await lib.withDB { db -> Int64 in
+        let folder = try db.scalar("SELECT folder_id FROM media WHERE id = ?", [mid])!
+        return try db.run("INSERT INTO media(folder_id, name, kind, size, mtime, taken_at, meta_state, thumb_state) VALUES(?, 'clock2037.jpg', 0, 1, 0, ?, 1, 1)",
+                          folder, 2_130_000_000.0)
+    }
+    let rows = try await lib.mediaIdsAndYears(.all)
+    check(rows.last?.id == future && rows.last?.year == 0, "a 2037 date is listed last, as no date: \(rows.suffix(2))")
+    let yearsList = try await lib.years().map(\.year)
+    check(!yearsList.contains(2037), "no 2037 year in the sidebar: \(yearsList)")
+    let noDate = try await lib.mediaIds(.year(0))
+    check(yearsList.last == 0 && noDate.contains(future), "a No date entry lists it: \(yearsList.suffix(2)) \(noDate)")
+    _ = try await lib.withDB { db in try db.run("DELETE FROM media WHERE id = ?", future) }
+    // Place names from the geocoding cache; covers default to the best-looking photo, or the one chosen.
+    _ = try await lib.withDB { db in
+        try db.run("UPDATE media SET lat = 49.18, lon = -0.37 WHERE id = ?", mid)
+        try db.run("INSERT INTO geo_names(cell, locality, area, country, at) VALUES(printf('%.2f:%.2f', round(49.18 * 50) / 50.0, round(-0.37 * 50) / 50.0), 'Caen', 'Normandie', 'France', 0)")
+    }
+    let place = try await lib.placeName(lat: 49.18, lon: -0.37)
+    check(place == "Caen, Normandie, France", "place name for a position: \(String(describing: place))")
+    let caen = try await lib.mediaIds(.search("caen"))
+    check(caen.contains(mid), "search finds photos by town")
+    let someFace = try await lib.withDB { try $0.scalar("SELECT id FROM faces WHERE person_id = ? ORDER BY id DESC LIMIT 1", [bobId]) }!
+    try await lib.setCover(.face, owner: bobId, region: someFace)
+    let cover = try await lib.owners(.face).first { $0.id == bobId }?.coverFaceId
+    check(cover == someFace, "chosen cover shown on the card")
+
+    // A hidden copy follows the kept photo: same face, same name; copies are not counted on cards.
+    let (copyMedia, copyFace, keptFace) = try await lib.withDB { db -> (Int64, Int64, Int64) in
+        let folder = try db.scalar("SELECT folder_id FROM media WHERE id = ?", [mid])!
+        let cm = try db.run("INSERT INTO media(folder_id, name, kind, size, mtime, taken_at, meta_state, thumb_state, dup_of) VALUES(?, 'IMG_0001 copie.JPG', 0, 1, 0, 0, 1, 1, ?)", folder, mid)
+        let named = try db.all("SELECT id, x, y, w, h FROM faces WHERE media_id = ? AND person_id = ? LIMIT 1", [mid, bobId]) { ($0.int(0), $0.double(1), $0.double(2), $0.double(3), $0.double(4)) }.first!
+        // Saved so the face is put back as it was for the tests below.
+        try db.run("CREATE TEMP TABLE kept_face AS SELECT * FROM faces WHERE id = ?", named.0)
+        // The copy is the same picture resized: its face is at about the same place.
+        let cf = try db.run("INSERT INTO faces(media_id,x,y,w,h,source) VALUES(?,?,?,?,?,1)", cm, named.1 + 0.004, named.2 - 0.004, named.3 * 1.02, named.4 * 1.02)
+        return (cm, cf, named.0)
+    }
+    let bobBefore = try await lib.owners(.face).first { $0.id == bobId }?.faces
+    _ = try await lib.mirrorToCopies(.face)
+    let mirrored = try await lib.region(.face, id: copyFace)?.personId
+    let bobAfter = try await lib.owners(.face).first { $0.id == bobId }?.faces
+    check(mirrored == bobId && bobBefore == bobAfter, "the copy's face takes the name; the card does not count the copy (\(String(describing: bobBefore)) → \(String(describing: bobAfter)))")
+    func faceState(_ id: Int64) async throws -> (person: Int64?, rejected: Int64?, ignored: Bool) {
+        try await lib.withDB { db in
+            try db.all("SELECT person_id, rejected_person_id, ignored FROM faces WHERE id = ?", [id]) { ($0.optInt(0), $0.optInt(1), $0.int(2) != 0) }.first!
+        }
+    }
+    // Taking the name away on the kept photo sticks: the copy does not give it back, it follows.
+    var since = Date().timeIntervalSince1970
+    _ = try await lib.unassign(.face, [keptFace])
+    _ = try await lib.mirrorToCopies(.face, since: since)
+    var keptF = try await faceState(keptFace), copy = try await faceState(copyFace)
+    check(keptF.person == nil && keptF.rejected == bobId && copy.person == nil && copy.rejected == bobId,
+          "unassign on the kept photo is not undone by its copy: kept \(keptF), copy \(copy)")
+    // Ignoring, then restoring, on the kept photo: the copy follows both ways.
+    since = Date().timeIntervalSince1970
+    _ = try await lib.setIgnored(.face, [keptFace], true)
+    _ = try await lib.mirrorToCopies(.face, since: since)
+    copy = try await faceState(copyFace)
+    check(copy.ignored, "ignoring on the kept photo reaches the copy")
+    since = Date().timeIntervalSince1970
+    _ = try await lib.setIgnored(.face, [keptFace], false)
+    _ = try await lib.mirrorToCopies(.face, since: since)
+    keptF = try await faceState(keptFace); copy = try await faceState(copyFace)
+    check(!keptF.ignored && !copy.ignored, "restoring on the kept photo reaches the copy: kept \(keptF), copy \(copy)")
+    // A name given on the copy (folder view) is not reverted: it goes to the kept photo.
+    since = Date().timeIntervalSince1970
+    try await lib.assign(.face, [copyFace], to: bobId)
+    _ = try await lib.mirrorToCopies(.face, since: since)
+    keptF = try await faceState(keptFace); copy = try await faceState(copyFace)
+    check(keptF.person == bobId && copy.person == bobId, "a name given on the copy reaches the kept photo: kept \(keptF), copy \(copy)")
+    // A neighbouring face (a group photo) is not taken for the copy's face.
+    let neighbour = try await lib.withDB { db -> Int64 in
+        let f = try db.all("SELECT x, y, w, h FROM faces WHERE id = ?", [keptFace]) { ($0.double(0), $0.double(1), $0.double(2), $0.double(3)) }.first!
+        return try db.run("INSERT INTO faces(media_id,x,y,w,h,source) VALUES(?,?,?,?,?,1)", copyMedia, f.0 + f.2 * 1.1, f.1, f.2, f.3)
+    }
+    _ = try await lib.mirrorToCopies(.face)
+    let next = try await faceState(neighbour)
+    check(next.person == nil, "the face next to it on the copy stays unnamed")
+    _ = try await lib.withDB { db in
+        try db.run("DELETE FROM media WHERE id = ?", copyMedia)
+        try db.run("""
+            UPDATE faces SET (person_id, rejected_person_id, suggested_person_id, ignored, human, human_at, source) =
+              (SELECT person_id, rejected_person_id, suggested_person_id, ignored, human, human_at, source FROM temp.kept_face) WHERE id = ?
+            """, keptFace)
+        try db.run("DROP TABLE temp.kept_face")
+    }
+
     // Reruns keep human decisions: an ignored Vision face survives --redo, not --redo --include-manual.
     _ = try await lib.resetFaces()
     let keptIgnored = try await lib.withDB { try $0.scalar("SELECT ignored FROM faces WHERE id = ?", [i2]) }

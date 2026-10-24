@@ -6,6 +6,7 @@ public enum DateSource: Int, Sendable {
     case fileName = 1   // IMG_20160910_162536.jpg, WhatsApp Image 2020-03-01 at 12.00.00.jpeg
     case folder = 2     // …/2019-06-24 vacances/…, …/2017-09 rentrée/…, …/2013/…
     case fileDate = 3   // the file's modification date (often a copy date)
+    case manual = 4     // set by hand in the app
 
     public var label: String {
         switch self {
@@ -13,6 +14,7 @@ public enum DateSource: Int, Sendable {
         case .fileName: "file name"
         case .folder: "folder name"
         case .fileDate: "file date"
+        case .manual: "date you set"
         }
     }
 }
