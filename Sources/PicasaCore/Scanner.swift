@@ -178,8 +178,10 @@ extension Library {
                         try db.run("UPDATE media SET size=?, mtime=?, meta_state=0, thumb_state=0, face_state=?, analysis_state=?, print=NULL, aesthetic=NULL, utility=0 WHERE id=?",
                                    e.size, e.mtime, na, na, old.id)
                         try db.run("DELETE FROM labels WHERE media_id = ?", old.id)
-                        try db.run("DELETE FROM animals WHERE media_id = ?", old.id)
-                        try db.run("DELETE FROM faces WHERE media_id = ? AND source = ? AND person_id IS NULL", old.id, FaceSource.vision.rawValue)
+                        // Named or ignored animals are kept, like named faces.
+                        try db.run("DELETE FROM animals WHERE media_id = ? AND human = 0", old.id)
+                        try db.run("UPDATE animals SET print = NULL WHERE media_id = ?", old.id)
+                        try db.run("DELETE FROM faces WHERE media_id = ? AND source = ? AND human = 0", old.id, FaceSource.vision.rawValue)
                         try db.run("UPDATE faces SET print = NULL WHERE media_id = ?", old.id)
                         r.updated += 1
                     }

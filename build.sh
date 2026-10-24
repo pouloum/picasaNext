@@ -36,7 +36,14 @@ if "$APP/Contents/MacOS/PicasaNext" --write-icns "$APP/Contents/Resources/AppIco
 else
   echo "[build] warning: app icon not generated"
 fi
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# Signing: ad hoc by default. macOS remembers privacy permissions (e.g. network volume access) per
+# signature, and an ad hoc one changes on every build, so it asks again after each rebuild.
+# SIGN_IDENTITY="PicasaNext Dev" (a code-signing certificate in the keychain, see README) keeps them.
+if [ -n "${SIGN_IDENTITY:-}" ]; then
+  codesign --force --sign "$SIGN_IDENTITY" --identifier local.picasanext "$APP" || echo "[build] warning: signing with '$SIGN_IDENTITY' failed"
+else
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+fi
 
 if [ "${TESTS:-0}" = 1 ]; then
   echo "[build] tests"

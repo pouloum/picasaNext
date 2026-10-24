@@ -1,0 +1,329 @@
+import Accelerate
+import Foundation
+
+/// Faces and animals are identified the same way: each detected region has a feature print, can be
+/// named (a person / a pet), gets suggestions, can be rejected for a name, or ignored altogether.
+/// faces → persons(person_id…), animals → pets(pet_id…).
+public enum IdentityKind: String, Sendable, Hashable {
+    case face, pet
+
+    var table: String { self == .face ? "faces" : "animals" }
+    var owners: String { self == .face ? "persons" : "pets" }
+    var col: String { self == .face ? "person_id" : "pet_id" }
+    var suggested: String { "suggested_" + col }
+    var rejected: String { "rejected_" + col }
+}
+
+extension Library {
+    /// Local-time bounds of a calendar year, as stored in `media.taken_at`.
+    static func yearRange(_ y: Int) -> (Double, Double) {
+        (DateComponents(calendar: .current, year: y).date!.timeIntervalSince1970,
+         DateComponents(calendar: .current, year: y + 1).date!.timeIntervalSince1970)
+    }
+
+    func yearClause(_ year: Int?, column: String = "m.taken_at") -> (String, [SQLBindable]) {
+        guard let year else { return ("", []) }
+        let (a, b) = Self.yearRange(year)
+        return (" AND \(column) >= ? AND \(column) < ?", [a, b])
+    }
+
+    /// Named people / pets with their item counts (optionally within one year), most items first.
+    /// People imported from Picasa contacts without any face in the library are left out.
+    public func owners(_ k: IdentityKind, year: Int? = nil) throws -> [PersonSummary] {
+        let (yc, ya) = yearClause(year)
+        let t = k.table
+        return try db.all("""
+            SELECT * FROM (
+              SELECT p.id, p.name,
+                (SELECT count(*) FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) = p.id AND t.ignored = 0\(yc)) n,
+                (SELECT count(*) FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) IS NULL AND t.\(k.suggested) = p.id AND t.ignored = 0\(yc)) s,
+                (SELECT t.id FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) = p.id\(yc) ORDER BY t.w DESC LIMIT 1)
+              FROM \(k.owners) p WHERE p.name != '' AND p.merged_into IS NULL)
+            WHERE n > 0 OR s > 0 ORDER BY n DESC
+            """, ya + ya + ya) {
+            PersonSummary(id: $0.int(0), name: $0.text(1), faces: Int($0.int(2)), suggestions: Int($0.int(3)), coverFaceId: $0.optInt(4))
+        }
+    }
+
+    /// Unnamed items without a pending suggestion (or, with `ignored`, the ignored ones) grouped by
+    /// feature-print similarity: leader clustering, an item joins the first group whose leader is
+    /// within `threshold`. Largest regions first, at most `maxItems`, so it stays interactive.
+    public func identityClusters(_ k: IdentityKind, ignored: Bool = false, year: Int? = nil,
+                                 threshold: Float = 0.8, maxItems: Int = 5_000) throws -> [FaceCluster] {
+        let (yc, ya) = yearClause(year)
+        var items: [(id: Int64, print: [Float]?)] = []
+        try db.query("""
+            SELECT t.id, t.print FROM \(k.table) t JOIN media m ON m.id = t.media_id
+            WHERE t.\(k.col) IS NULL AND t.ignored = ? \(ignored ? "" : "AND t.\(k.suggested) IS NULL") AND m.ignored = 0\(yc)
+            ORDER BY t.w * t.h DESC LIMIT ?
+            """, [ignored ? 1 : 0] + ya + [maxItems]) { r in
+            items.append((r.int(0), r.blob(1).map { d in d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }))
+        }
+        guard !items.isEmpty else { return [] }
+        let dim = items.compactMap(\.print).first { !$0.isEmpty }?.count ?? 0
+        var leaders: [[Float]] = []
+        var members: [[Int64]] = []
+        var loose: [Int64] = [] // ignored items without a print: one group of their own
+        var single: [[Int64]] = [] // unnamed items without a print (not analysed yet): one card each
+        for f in items {
+            guard let p = f.print, dim > 0, p.count == dim else { if ignored { loose.append(f.id) } else { single.append([f.id]) }; continue }
+            var best = -1, bestScore: Float = threshold
+            for (i, l) in leaders.enumerated() {
+                var s: Float = 0
+                vDSP_dotpr(p, 1, l, 1, &s, vDSP_Length(dim))
+                if s >= bestScore { best = i; bestScore = s }
+            }
+            if best >= 0 { members[best].append(f.id) } else { leaders.append(p); members.append([f.id]) }
+        }
+        if !loose.isEmpty { members.append(loose) }
+        // Without a print an item cannot be grouped, but it can still be named: after the groups.
+        return members.map { FaceCluster(coverFaceId: $0[0], faceIds: $0) }
+            .sorted { $0.faceIds.count > $1.faceIds.count } + single.map { FaceCluster(coverFaceId: $0[0], faceIds: $0) }
+    }
+
+    /// Named, unnamed (to identify) and ignored items, optionally within one year: for the filter badges.
+    public func identityCounts(_ k: IdentityKind, year: Int? = nil) throws -> (named: Int, unnamed: Int, ignored: Int) {
+        let (yc, ya) = yearClause(year)
+        return try db.all("""
+            SELECT coalesce(sum(t.\(k.col) IS NOT NULL AND t.ignored = 0), 0), coalesce(sum(t.\(k.col) IS NULL AND t.ignored = 0), 0),
+                   coalesce(sum(t.ignored), 0)
+            FROM \(k.table) t JOIN media m ON m.id = t.media_id WHERE m.ignored = 0\(yc)
+            """, ya) { (Int($0.int(0)), Int($0.int(1)), Int($0.int(2))) }.first ?? (0, 0, 0)
+    }
+
+    /// Names items (creates the person / pet if needed). Returns its id.
+    @discardableResult
+    public func nameItems(_ k: IdentityKind, _ ids: [Int64], name: String) throws -> Int64? {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !ids.isEmpty else { return nil }
+        return try db.transaction {
+            var pid = try db.scalar("SELECT coalesce(merged_into, id) FROM \(k.owners) WHERE name = ? COLLATE NOCASE ORDER BY merged_into IS NOT NULL LIMIT 1", [trimmed])
+            if pid == nil {
+                if k == .pet {
+                    let species = try db.all("SELECT species FROM animals WHERE id = ?", [ids[0]]) { $0.text(0) }.first
+                    pid = try db.run("INSERT INTO pets(name, species) VALUES(?, ?)", trimmed, species)
+                } else {
+                    pid = try db.run("INSERT INTO persons(name) VALUES(?)", trimmed)
+                }
+            }
+            try assignRows(k, ids, to: pid!)
+            return pid
+        }
+    }
+
+    /// Gives items to an existing person / pet, as a user action.
+    public func assign(_ k: IdentityKind, _ ids: [Int64], to owner: Int64) throws {
+        try db.transaction { try assignRows(k, ids, to: owner) }
+    }
+
+    private func assignRows(_ k: IdentityKind, _ ids: [Int64], to owner: Int64) throws {
+        for id in ids {
+            if k == .face {
+                // Named by the user: `manual`, so a later .picasa.ini re-import does not replace it.
+                try db.run("UPDATE faces SET person_id = ?, suggested_person_id = NULL, ignored = 0, source = ?, human = 1, human_at = ? WHERE id = ?", owner, FaceSource.manual.rawValue, Date().timeIntervalSince1970, id)
+            } else {
+                try db.run("UPDATE animals SET pet_id = ?, suggested_pet_id = NULL, ignored = 0, human = 1, human_at = ? WHERE id = ?", owner, Date().timeIntervalSince1970, id)
+            }
+        }
+    }
+
+    /// Merges `source` into `target`: its items, suggestions and rejections move over; it stays as an
+    /// alias (`merged_into`) so names and Picasa re-imports keep landing on the target.
+    public func merge(_ k: IdentityKind, _ source: Int64, into target: Int64) throws {
+        guard source != target else { return }
+        let t = k.table
+        try db.transaction {
+            try db.run("UPDATE \(t) SET \(k.col) = ? WHERE \(k.col) = ?", target, source)
+            try db.run("UPDATE \(t) SET \(k.suggested) = ? WHERE \(k.suggested) = ?", target, source)
+            try db.run("UPDATE \(t) SET \(k.rejected) = ? WHERE \(k.rejected) = ?", target, source)
+            // An item suggested for the target that had been rejected for it stays unsuggested.
+            try db.run("UPDATE \(t) SET \(k.suggested) = NULL WHERE \(k.suggested) = \(k.rejected)")
+            try db.run("UPDATE \(k.owners) SET merged_into = ? WHERE id = ? OR merged_into = ?", target, source, source)
+        }
+    }
+
+    /// People (pets) whose names are the same once case, accents and spacing are ignored — typically
+    /// the same person imported from several Picasa contacts. Each group: the one with the most
+    /// photos first (the one the others would be merged into).
+    public func duplicateOwners(_ k: IdentityKind) throws -> [[PersonSummary]] {
+        func key(_ n: String) -> String {
+            n.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        let groups = Dictionary(grouping: try owners(k), by: { key($0.name) }).values.filter { $0.count > 1 }
+        return groups.map { $0.sorted { ($0.faces + $0.suggestions, -$0.id) > ($1.faces + $1.suggestions, -$1.id) } }
+            .sorted { $0.map(\.faces).reduce(0, +) > $1.map(\.faces).reduce(0, +) }
+    }
+
+    /// Merges each group into its first member. Returns the number of people merged away.
+    @discardableResult
+    public func mergeDuplicates(_ k: IdentityKind, _ groups: [[PersonSummary]]) throws -> Int {
+        var n = 0
+        for g in groups where g.count > 1 {
+            for o in g.dropFirst() { try merge(k, o.id, into: g[0].id); n += 1 }
+        }
+        return n
+    }
+
+    public func renameOwner(_ k: IdentityKind, _ id: Int64, to name: String) throws {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        try db.run("UPDATE \(k.owners) SET name = ? WHERE id = ?", n, id)
+    }
+
+    /// Ignores (or restores) unnamed items: ignored ones are never suggested nor grouped with the
+    /// unnamed, and only show up in the "Ignored" filter.
+    @discardableResult
+    public func setIgnored(_ k: IdentityKind, _ ids: [Int64], _ on: Bool) throws -> Int {
+        try db.transaction {
+            var n = 0
+            for id in ids {
+                try db.run("UPDATE \(k.table) SET ignored = ?, \(k.suggested) = NULL, human = 1, human_at = ? WHERE id = ? AND \(k.col) IS NULL", on, Date().timeIntervalSince1970, id)
+                n += db.changes
+            }
+            return n
+        }
+    }
+
+    /// Accepts the current suggestions of a person / pet, for some photos or all of them.
+    @discardableResult
+    public func confirm(_ k: IdentityKind, owner: Int64, mediaIds: [Int64]? = nil) throws -> Int {
+        try db.transaction {
+            let now = Date().timeIntervalSince1970
+            let set = (k == .face ? "person_id = suggested_person_id, suggested_person_id = NULL, source = \(FaceSource.manual.rawValue)"
+                                  : "pet_id = suggested_pet_id, suggested_pet_id = NULL") + ", human = 1, human_at = \(now)"
+            guard let mediaIds else {
+                try db.run("UPDATE \(k.table) SET \(set) WHERE \(k.col) IS NULL AND \(k.suggested) = ?", owner)
+                return db.changes
+            }
+            var n = 0
+            for m in mediaIds {
+                try db.run("UPDATE \(k.table) SET \(set) WHERE media_id = ? AND \(k.col) IS NULL AND \(k.suggested) = ?", m, owner)
+                n += db.changes
+            }
+            return n
+        }
+    }
+
+    /// Takes faces / animals away from a person / pet (a wrong confirmation): they become unnamed
+    /// again, remembered as "not this one" so they are not suggested back, as a human decision.
+    @discardableResult
+    public func unassign(_ k: IdentityKind, _ ids: [Int64]) throws -> Int {
+        try db.transaction {
+            var n = 0
+            for id in ids {
+                try db.run("""
+                    UPDATE \(k.table) SET \(k.rejected) = \(k.col), \(k.col) = NULL, \(k.suggested) = NULL, human = 1, human_at = ?
+                    WHERE id = ? AND \(k.col) IS NOT NULL
+                    """, Date().timeIntervalSince1970, id)
+                n += db.changes
+            }
+            return n
+        }
+    }
+
+    /// The faces / animals of a person / pet in some photos (to act on photos selected in a grid).
+    public func regionIds(_ k: IdentityKind, owner: Int64, mediaIds: [Int64]) throws -> [Int64] {
+        guard !mediaIds.isEmpty else { return [] }
+        return try db.all("SELECT id FROM \(k.table) WHERE \(k.col) = ? AND media_id IN (\(mediaIds.map(String.init).joined(separator: ",")))",
+                          [owner]) { $0.int(0) }
+    }
+
+    /// Rejects a person's / pet's suggestions in some photos; remembered so they are not proposed again.
+    @discardableResult
+    public func reject(_ k: IdentityKind, owner: Int64, mediaIds: [Int64]) throws -> Int {
+        try db.transaction {
+            var n = 0
+            for m in mediaIds {
+                try db.run("""
+                    UPDATE \(k.table) SET \(k.rejected) = \(k.suggested), \(k.suggested) = NULL, human = 1, human_at = \(Date().timeIntervalSince1970)
+                    WHERE media_id = ? AND \(k.col) IS NULL AND \(k.suggested) = ?
+                    """, m, owner)
+                n += db.changes
+            }
+            return n
+        }
+    }
+
+    /// One region (face or animal) with its name, for crops and the viewer.
+    public func region(_ k: IdentityKind, id: Int64) throws -> FaceRecord? {
+        try db.all("""
+            SELECT t.id, t.media_id, t.x, t.y, t.w, t.h, t.\(k.col), t.\(k.suggested), p.name, t.ignored
+            FROM \(k.table) t LEFT JOIN \(k.owners) p ON p.id = coalesce(t.\(k.col), t.\(k.suggested)) WHERE t.id = ?
+            """, [id], Self.region).first
+    }
+
+    /// Every region of a photo (faces or animals), ignored ones included (flagged).
+    public func regions(_ k: IdentityKind, mediaId: Int64) throws -> [FaceRecord] {
+        try db.all("""
+            SELECT t.id, t.media_id, t.x, t.y, t.w, t.h, t.\(k.col), t.\(k.suggested), p.name, t.ignored
+            FROM \(k.table) t LEFT JOIN \(k.owners) p ON p.id = coalesce(t.\(k.col), t.\(k.suggested)) WHERE t.media_id = ?
+            """, [mediaId], Self.region)
+    }
+
+    static func region(_ r: Database.Row) -> FaceRecord {
+        FaceRecord(id: r.int(0), mediaId: r.int(1), x: r.double(2), y: r.double(3), w: r.double(4), h: r.double(5),
+                   personId: r.optInt(6), suggestedPersonId: r.optInt(7), personName: r.optText(8), ignored: r.int(9) != 0)
+    }
+
+    /// Changes when items are added, removed, named, suggested or ignored.
+    public func identityToken(_ k: IdentityKind) throws -> [Int64] {
+        try db.all("""
+            SELECT count(*), coalesce(max(id), 0), count(\(k.col)), count(\(k.suggested)), count(\(k.rejected)), sum(ignored), count(print)
+            FROM \(k.table)
+            """) { [$0.int(0), $0.int(1), $0.int(2), $0.int(3), $0.int(4), $0.int(5), $0.int(6)] }.first ?? []
+    }
+
+    // MARK: - Suggestion engine data
+
+    /// Normalized mean print per named person / pet.
+    func centroids(_ k: IdentityKind) throws -> (persons: [Int64], centroids: [Float], dim: Int) {
+        var sums: [Int64: [Float]] = [:]
+        var dim = 0
+        try db.query("SELECT \(k.col), print FROM \(k.table) WHERE \(k.col) IS NOT NULL AND print IS NOT NULL") { r in
+            guard let d = r.blob(1) else { return }
+            let v = d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            guard !v.isEmpty else { return } // animal crop that gave no print
+            if dim == 0 { dim = v.count }
+            guard v.count == dim else { return }
+            let pid = r.int(0)
+            if var s = sums[pid] { vDSP_vadd(s, 1, v, 1, &s, 1, vDSP_Length(dim)); sums[pid] = s } else { sums[pid] = v }
+        }
+        var persons: [Int64] = [], flat: [Float] = []
+        for (pid, var s) in sums {
+            var n: Float = 0
+            vDSP_svesq(s, 1, &n, vDSP_Length(dim)); n = sqrt(n)
+            if n > 0 { vDSP_vsdiv(s, 1, &n, &s, 1, vDSP_Length(dim)) }
+            persons.append(pid); flat.append(contentsOf: s)
+        }
+        return (persons, flat, dim)
+    }
+
+    /// Faces / animals a human said are not someone (rejected suggestion, or taken away), with their print.
+    func counterExamples(_ k: IdentityKind, dim: Int) throws -> [(owner: Int64, print: [Float])] {
+        try db.all("SELECT \(k.rejected), print FROM \(k.table) WHERE \(k.rejected) IS NOT NULL AND print IS NOT NULL") { r in
+            (r.int(0), r.blob(1).map { $0.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } } ?? [])
+        }.filter { $0.print.count == dim }
+    }
+
+    func unnamedPrints(_ k: IdentityKind, after: Int64, limit: Int, dim: Int) throws -> [(id: Int64, print: [Float], rejected: Int64?)] {
+        try db.all("""
+            SELECT id, print, \(k.rejected) FROM \(k.table) WHERE \(k.col) IS NULL AND ignored = 0 AND print IS NOT NULL AND id > ? ORDER BY id LIMIT ?
+            """, [after, limit]) { r in
+            (r.int(0), r.blob(1).map { $0.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } } ?? [], r.optInt(2))
+        }.filter { $0.print.count == dim }
+    }
+
+    /// Paging cursor independent of the dim filter (so a batch of wrong-sized prints cannot end the loop early).
+    func lastUnnamedPrintId(_ k: IdentityKind, after: Int64, limit: Int) throws -> Int64? {
+        try db.scalar("""
+            SELECT max(id) FROM (SELECT id FROM \(k.table) WHERE \(k.col) IS NULL AND ignored = 0 AND print IS NOT NULL AND id > ? ORDER BY id LIMIT ?)
+            """, [after, limit])
+    }
+
+    func storeSuggestions(_ k: IdentityKind, _ s: [(Int64, Int64?)]) throws {
+        try db.transaction {
+            for (id, pid) in s { try db.run("UPDATE \(k.table) SET \(k.suggested) = ? WHERE id = ?", pid, id) }
+        }
+    }
+}

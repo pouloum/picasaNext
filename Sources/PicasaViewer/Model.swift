@@ -5,7 +5,10 @@ import PicasaCore
 enum SidebarItem: Hashable {
     case filter(MediaFilter, String)
     case people
+    case pets
+    case relations
     case labels
+    case places
 }
 
 @MainActor
@@ -18,10 +21,16 @@ final class AppModel: ObservableObject {
     /// Known people/labels/albums for autocompletion in the token field.
     @Published var vocabulary: [SearchTerm] = []
     @Published var ids: [Int64] = []
+    /// Year sections of `ids` (empty for groupings where years are not contiguous: similar, bursts).
+    @Published var sections: [GridSection] = []
+    /// Grouped views (duplicates, bursts, similar): one cover per group, expanded on demand.
+    @Published var groups: [MediaGroup] = []
+    @Published var expanded: Set<Int64> = []
+    var groupBadges: [Int64: Int] { Dictionary(uniqueKeysWithValues: groups.map { ($0.cover, $0.members.count) }) }
+    /// Members shown under an expanded cover (tinted in the grid).
+    var expandedMembers: Set<Int64> { Set(groups.filter { expanded.contains($0.cover) }.flatMap { $0.members.dropFirst() }) }
     @Published var folders: [FolderNode] = []
     @Published var years: [(year: Int, count: Int)] = []
-    @Published var persons: [PersonSummary] = []
-    @Published var clusters: [FaceCluster] = []
     @Published var albums: [AlbumSummary] = []
     @Published var stats: Library.Stats?
     /// Viewer state: its own snapshot of ids, so grid reloads cannot shift what is being viewed.
@@ -30,7 +39,18 @@ final class AppModel: ObservableObject {
     @Published var job: String?
     @Published var jobDetail: String?
     @Published var error: String?
+    /// Bumped each time the library changed (a scan in the app or in picasa-cli): views that load
+    /// their own data (people, labels, places) reload on it.
+    @Published var revision = 0
+    /// The first grid load is done (until then the grid shows a spinner, not "No photos").
+    @Published var loaded = false
+    /// The library is being written by someone else (picasa-cli in a terminal): changes seen recently.
+    @Published var externalActivity = false
     let thumbs: ThumbnailCache
+    private var lastToken: [Int64] = []
+    private var refreshing = false
+    private var refreshCost: TimeInterval = 0
+    private var lastChange = Date.distantPast
 
     static var libraryURL: URL {
         if let p = ProcessInfo.processInfo.environment["PICASANEXT_LIBRARY"] { return URL(fileURLWithPath: p) }
@@ -40,7 +60,51 @@ final class AppModel: ObservableObject {
     init() {
         do { library = try Library(root: Self.libraryURL) } catch { fatalError("Cannot open library: \(error)") }
         thumbs = ThumbnailCache(store: library.thumbs)
-        Task { await refreshAll() }
+        Task {
+            // The grid first (what the user looks at), then the sidebar and counters.
+            await reloadGrid()
+            loaded = true
+            await refreshAll()
+            // After an upgrade (or on a library indexed by an older picasa-cli): build the groups.
+            if (try? await library.groupsNeedRebuild()) == true {
+                runJob("Finding duplicates, bursts and similar photos") { lib, _ in _ = try await lib.groupSimilar() }
+            }
+            // Debugging aid: PICASANEXT_OPEN_FIRST=1 opens the first photo at launch.
+            if ProcessInfo.processInfo.environment["PICASANEXT_OPEN_FIRST"] != nil { open(ids, at: 0) }
+            await watchLibrary()
+        }
+    }
+
+    /// Polls the library's change token and refreshes everything when it moved, so the grid,
+    /// sidebar counts and other sections follow a running scan/index/analysis (here or in a terminal).
+    private func watchLibrary() async {
+        lastToken = (try? await library.changeToken()) ?? []
+        var lastRefresh = Date.distantPast
+        var gridToken = lastToken
+        while !Task.isCancelled {
+            // The check itself is two integers read from SQLite (microseconds), so it can run often:
+            // every second on Last indexed (new photos land there), every 2 s elsewhere.
+            let live = !isSearching && currentFilter == .recent
+            try? await Task.sleep(for: .seconds(live ? 1 : 2))
+            let busy = job == nil && Date().timeIntervalSince(lastChange) < 20
+            if busy != externalActivity { externalActivity = busy }
+            // Last indexed: only its grid is reloaded right away (one indexed query, 2 000 rows max);
+            // the rest of the app follows the slower full refresh below.
+            if live, let t = try? await library.changeToken(), t != gridToken, !refreshing {
+                gridToken = t
+                if t.first != lastToken.first { lastChange = Date() }
+                await reloadGrid()
+            }
+            guard let t = try? await library.changeToken(), t != lastToken, !refreshing else { continue }
+            if t.first != lastToken.first { lastChange = Date() } // data_version: written by another process
+            // The refresh re-runs the sidebar/grid queries: a first change shows up within 2 s, then
+            // while a scan keeps writing, at most every 10 s (more when a refresh itself is slow).
+            let start = Date()
+            if start.timeIntervalSince(lastRefresh) < max(10, refreshCost * 10) { continue }
+            await refreshAll()
+            refreshCost = Date().timeIntervalSince(start)
+            lastRefresh = Date()
+        }
     }
 
     var isSearching: Bool { !tokens.isEmpty || !search.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -52,16 +116,18 @@ final class AppModel: ObservableObject {
     }
 
     func refreshAll() async {
+        refreshing = true
+        defer { refreshing = false }
+        if let t = try? await library.changeToken() { lastToken = t }
         do {
             folders = try await library.folders()
             years = try await library.years()
-            persons = try await library.persons()
             vocabulary = try await library.searchVocabulary()
-            clusters = try await library.unnamedClusters()
             albums = try await library.albums()
             stats = try await library.stats()
         } catch { self.error = "\(error)" }
         await reloadGrid()
+        revision += 1
     }
 
     func open(_ list: [Int64], at index: Int) {
@@ -71,8 +137,36 @@ final class AppModel: ObservableObject {
     }
 
     func reloadGrid() async {
-        if !isSearching, selection == .people || selection == .labels { return }
-        do { ids = try await library.mediaIds(currentFilter) } catch { self.error = "\(error)"; ids = [] }
+        if !isSearching, selection == .people || selection == .pets || selection == .relations || selection == .labels || selection == .places { return }
+        let f = currentFilter
+        let kind: GroupKind? = { switch f { case .bursts: .burst; case .similar: .similar; case .duplicates: .duplicates; default: nil } }()
+        if let kind {
+            do {
+                let g = try await library.mediaGroups(kind)
+                if g.map(\.cover) != groups.map(\.cover) { expanded = expanded.intersection(g.map(\.cover)) }
+                groups = g
+                sections = []
+                ids = flattenGroups()
+            } catch { self.error = "\(error)"; ids = []; groups = [] }
+            return
+        }
+        groups = []
+        do {
+            let rows = try await library.mediaIdsAndYears(f)
+            let grouped: Bool = { switch f { case .recent: true; default: false } }()
+            sections = grouped ? [] : GridSection.byYear(rows.map(\.year))
+            ids = rows.map(\.id)
+        } catch { self.error = "\(error)"; ids = []; sections = [] }
+    }
+
+    func flattenGroups() -> [Int64] {
+        groups.flatMap { expanded.contains($0.cover) ? $0.members : [$0.cover] }
+    }
+
+    /// Opens / closes a group in a grouped view (its badge, or a double-click on its cover).
+    func toggleGroup(_ cover: Int64) {
+        if expanded.contains(cover) { expanded.remove(cover) } else { expanded.insert(cover) }
+        ids = flattenGroups()
     }
 
     /// Called by the token field on every edit.
@@ -139,12 +233,25 @@ final class AppModel: ObservableObject {
 
     nonisolated static func index(_ lib: Library, _ report: @escaping ProgressHandler) async throws {
         let ix = Indexer(library: lib)
-        _ = try await ix.extractMetadata { report($0) }
-        _ = try await ix.generateThumbnails { report($0) }
+        _ = try await ix.run { report($0) }
         _ = try await Analyzer(library: lib, concurrency: max(1, ProcessInfo.processInfo.activeProcessorCount / 2)).run { report($0) }
         _ = try await FaceEngine(library: lib).suggestNames()
+        _ = try await Analyzer(library: lib).petPrints { report($0) }
+        _ = try await IdentityEngine.suggest(library: lib, kind: .pet, threshold: 0.82)
         try await lib.groupSimilar()
     }
+
+    /// Animals can only be grouped and suggested once they have a print: compute the missing ones
+    /// (a few hundred photos at most) when Animals is opened, once per session.
+    func ensurePetPrints() async {
+        guard !petPrintsTried, job == nil, ((try? await library.animalsMissingPrint()) ?? 0) > 0 else { return }
+        petPrintsTried = true
+        runJob("Recognising pets") { lib, report in
+            _ = try await Analyzer(library: lib).petPrints { report($0) }
+            _ = try await IdentityEngine.suggest(library: lib, kind: .pet, threshold: 0.82)
+        }
+    }
+    private var petPrintsTried = false
 
     private func runJob(_ title: String, _ body: @escaping @Sendable (Library, @escaping ProgressHandler) async throws -> Void) {
         guard job == nil else { return }
@@ -168,22 +275,62 @@ final class AppModel: ObservableObject {
         try? await library.setStar([item.id], !item.star)
     }
 
-    /// Names a group of faces, then refreshes suggestions so similar faces get proposed.
-    func name(faces: [Int64], as name: String) async {
+    // People and pets share these (IdentityKind): every change re-runs the suggestions of that kind.
+
+    /// Runs an edit, then refreshes suggestions so similar faces / animals get proposed.
+    func identityEdit(_ k: IdentityKind, _ body: @escaping @Sendable (Library) async throws -> Void) async {
         do {
-            try await library.nameFaces(faces, name: name)
-            _ = try await FaceEngine(library: library).suggestNames()
+            try await body(library)
+            _ = try await IdentityEngine.suggest(library: library, kind: k, threshold: 0.82)
         } catch { self.error = "\(error)" }
         await refreshAll()
     }
 
-    func confirmAll(_ p: PersonSummary) async {
-        _ = try? await library.confirmSuggestions(personId: p.id)
-        await refreshAll()
+    func name(_ k: IdentityKind, _ ids: [Int64], as name: String) async {
+        await identityEdit(k) { _ = try await $0.nameItems(k, ids, name: name) }
+    }
+
+    /// Drag and drop: a person onto another merges them.
+    func merge(_ k: IdentityKind, _ source: PersonSummary, into target: PersonSummary) async {
+        await identityEdit(k) { try await $0.merge(k, source.id, into: target.id) }
+    }
+
+    /// Drag and drop: an unnamed group onto a person names the group.
+    func assign(_ k: IdentityKind, _ ids: [Int64], to owner: PersonSummary) async {
+        await identityEdit(k) { try await $0.assign(k, ids, to: owner.id) }
+    }
+
+    func setIgnored(_ k: IdentityKind, _ ids: [Int64], _ on: Bool) async {
+        await identityEdit(k) { _ = try await $0.setIgnored(k, ids, on) }
+    }
+
+    func confirmAll(_ k: IdentityKind, _ p: PersonSummary) async {
+        await identityEdit(k) { _ = try await $0.confirm(k, owner: p.id) }
+    }
+
+    /// Merging people sharing a name rewrites many faces: a background job with the toolbar spinner.
+    func mergeDuplicates(_ k: IdentityKind, _ groups: [[PersonSummary]]) {
+        runJob("Merging \(k == .face ? "people" : "pets")") { lib, _ in
+            _ = try await lib.mergeDuplicates(k, groups)
+            _ = try await IdentityEngine.suggest(library: lib, kind: k, threshold: 0.82)
+        }
+    }
+
+    /// Renaming to an existing name merges into that person / pet.
+    func rename(_ k: IdentityKind, _ p: PersonSummary, to name: String) async {
+        await identityEdit(k) { lib in
+            let all = try await lib.owners(k)
+            if let other = all.first(where: { $0.id != p.id && $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+                try await lib.merge(k, p.id, into: other.id)
+            } else {
+                try await lib.renameOwner(k, p.id, to: name)
+            }
+        }
     }
 }
 
-/// In-memory thumbnail cache in front of the on-disk ThumbnailStore.
+/// In-memory thumbnail cache in front of the on-disk ThumbnailStore. Thumbnails are only made by
+/// the indexer (picasa-cli index / the app's jobs); the grids only show items that have one.
 final class ThumbnailCache: @unchecked Sendable {
     private let cache = NSCache<NSNumber, NSImage>()
     let store: ThumbnailStore

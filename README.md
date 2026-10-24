@@ -20,9 +20,11 @@ your photo folders.
 | Thumbnails | 320 px JPEG cache (`thumbs/ab/cd/<id>.jpg`), from embedded EXIF/RAW previews when present; first frame for videos. |
 | Picasa import | `.picasa.ini` (per folder, read during scan): stars, captions, faces + names (`[Contacts2]`), local albums (`[.album:…]`), keywords, rotation, `filters=` edit chain. `contacts.xml` (person names). Optional `db3` (`thumbindex.db`, `imagedata_*.pmp`, `albumdata_*.pmp`, `starlist.txt`): captions, faces/people, GPS, stars, thumbnails — paths are matched by trailing components + file size, so the library may have moved disks/OS. |
 | Analysis | One Apple Vision pass per image on a single decoded 1600 px copy: faces (+ a print per face), scene labels (~1 300 classes, searchable), cats/dogs, a whole-image print, and on macOS 15+ an aesthetics score with a "utility" flag (screenshots, receipts, documents). |
-| Faces | Replaces Picasa's Neven engine: unnamed faces are grouped by similarity (name a whole group at once) and suggested names come from cosine similarity to the people already named. Rejected suggestions are remembered. |
+| Export | `picasa-cli export [--format picasa\|xmp\|all] [--dry-run] [PATH]` (opt-in; nothing else ever writes to the media folders). `picasa`: stars, captions, named faces (with `[Contacts2]`), keywords and albums into each folder's `.picasa.ini` (previous file kept as `.picasa.ini.bak`; `rotate`, `filters` and unknown keys untouched; re-reading it never duplicates faces). `xmp`: one `IMG_0001.xmp` sidecar per photo (RAW+JPEG pairs share one): rating, caption, keywords, people and pets as MWG named regions and `People\|`/`Pets\|`/`Albums\|` hierarchical keywords; sidecars written by other programs are left alone. |
+| Faces | Replaces Picasa's Neven engine: unnamed faces are grouped by similarity (name a whole group at once) and suggested names come from cosine similarity to the people already named. Rejected suggestions are remembered. As in Picasa, drag a person onto another to merge them (the merged one stays as an alias for later Picasa re-imports), or an unnamed group onto a person to name it. Faces can be ignored (never suggested, listed under Ignored, restorable). People and Animals share one screen: Groups (cards) or Photos (grid by year), a year filter, and Named / To identify / Ignored filters (unidentified groups hidden by default). |
+| Pets | Each detected cat/dog gets a feature print of its crop, so animals are grouped, named and suggested like faces (Animals in the sidebar). Telling two similar-looking animals apart is unreliable; naming corrects it. |
 | Discover | **Best photos** (top 10 % aesthetics, documents excluded), **Similar & duplicates** (exact duplicates by quick hash anywhere + near-duplicates within a 10-minute window, best-looking first), **Animals**, **Screenshots & documents**. |
-| Viewer | SwiftUI app: All / Starred / Videos / People / Albums / Years / Folders, search (name, folder, caption, tag, person, album, camera), virtualized grid (NSCollectionView), viewer with face boxes (click to name), video playback, info panel, star toggle. |
+| Viewer | SwiftUI app: All / Starred / Videos / People / Albums / Years / Folders, search (name, folder, caption, tag, person, album, camera), virtualized grid (NSCollectionView), viewer with face boxes (click to name), video playback (Space closes, Return plays/pauses), info panel, star toggle. Every section follows a running scan/index/analysis live — in the app or in `picasa-cli` — by polling the database's change counter, keeping the grid's scroll position and selection. |
 
 Edits made in PicasaNext (stars, names, captions) live in the library database only.
 
@@ -101,3 +103,14 @@ Tests/Runner            test runner (synthetic Picasa files + end-to-end library
 
 Photo editing (Picasa filters are imported and kept but not rendered), collages/movies, printing,
 upload to Google services (discontinued), writing back to `.picasa.ini` / XMP.
+
+## macOS permission prompts
+
+Opening a photo reads the original; on a network share macOS asks once for access to network
+volumes. It remembers the answer per code signature, and `build.sh` signs ad hoc by default (a new
+signature on each build), so the question comes back after every rebuild. To keep the answer:
+
+1. Keychain Access ▸ Certificate Assistant ▸ Create a Certificate… — name `PicasaNext Dev`,
+   identity type *Self Signed Root*, certificate type *Code Signing*.
+2. Build with it: `SIGN_IDENTITY="PicasaNext Dev" ./build.sh` (or an Apple Development certificate
+   from Xcode). Allow once; later builds signed the same way are not asked again.

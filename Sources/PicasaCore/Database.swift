@@ -99,6 +99,8 @@ public final class Database: @unchecked Sendable {
     }
 
     public var changes: Int { Int(sqlite3_changes(handle)) }
+    /// Rows changed by this connection since it was opened.
+    public var totalChanges: Int64 { sqlite3_total_changes64(handle) }
 
     /// Iterate rows; the Row is only valid inside the closure.
     public func query(_ sql: String, _ args: [SQLBindable] = [], _ body: (Row) throws -> Void) throws {

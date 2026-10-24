@@ -85,7 +85,7 @@ extension Library {
                 let id: Int64
                 if let c = p.contactId {
                     id = try PicasaImport.personId(picasaId: c, name: p.name, email: nil, db: db)
-                } else if !p.name.isEmpty, let existing = try db.scalar("SELECT id FROM persons WHERE name = ? COLLATE NOCASE", [p.name]) {
+                } else if !p.name.isEmpty, let existing = try db.scalar("SELECT coalesce(merged_into, id) FROM persons WHERE name = ? COLLATE NOCASE ORDER BY merged_into IS NOT NULL LIMIT 1", [p.name]) {
                     id = existing
                 } else {
                     id = try PicasaImport.personId(picasaId: "db3:\(p.row)", name: p.name, email: nil, db: db)

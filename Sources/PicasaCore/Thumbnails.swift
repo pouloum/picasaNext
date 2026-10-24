@@ -22,6 +22,21 @@ public final class ThumbnailStore: Sendable {
             .appendingPathComponent("\(id).jpg")
     }
 
+    /// Face crops for People, cached next to the thumbnails (thumbs/faces/<faceId>.jpg) so the
+    /// originals, possibly on a network disk, are read at most once per face. The box is part of the
+    /// name: SQLite may reuse the id of a deleted face.
+    public func faceURL(id: Int64, x: Double, y: Double, w: Double) -> URL {
+        root.appendingPathComponent("faces", isDirectory: true)
+            .appendingPathComponent("\(id)_\(Int(x * 10_000))_\(Int(y * 10_000))_\(Int(w * 10_000)).jpg")
+    }
+
+    public func loadImage(_ url: URL) -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    }
+
+    public func store(_ image: CGImage, at url: URL) { _ = write(image, to: url) }
+
     public func exists(id: Int64) -> Bool { FileManager.default.fileExists(atPath: url(id: id).path) }
 
     func remove(id: Int64) { try? FileManager.default.removeItem(at: url(id: id)) }

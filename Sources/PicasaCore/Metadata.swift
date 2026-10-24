@@ -119,10 +119,10 @@ public enum MetadataReader {
 
 extension Library {
     /// Pending work for a stage, with absolute paths.
-    func pending(stateColumn: String, limit: Int) throws -> [(id: Int64, url: URL, kind: MediaKind)] {
+    func pending(stateColumn: String, limit: Int, metadataRead: Bool = false) throws -> [(id: Int64, url: URL, kind: MediaKind)] {
         try db.all("""
             SELECT m.id, f.path || '/' || m.name, m.kind FROM media m JOIN folders f ON f.id = m.folder_id
-            WHERE m.\(stateColumn) = 0 AND m.ignored = 0 LIMIT ?
+            WHERE m.\(stateColumn) = 0 AND m.ignored = 0\(metadataRead ? " AND m.meta_state != 0" : "") LIMIT ?
             """, [limit]) { ($0.int(0), URL(fileURLWithPath: $0.text(1)), MediaKind(rawValue: Int($0.int(2))) ?? .image) }
     }
 
@@ -132,16 +132,22 @@ extension Library {
                 guard let m else { try db.run("UPDATE media SET meta_state = 3 WHERE id = ?", id); continue }
                 try db.run("""
                     UPDATE media SET width=?, height=?, orientation=?, taken_at=coalesce(?, taken_at), lat=coalesce(?, lat),
-                    lon=coalesce(?, lon), camera=?, duration=?, quick_hash=?, exif=?, meta_state=1 WHERE id=?
+                    lon=coalesce(?, lon), camera=?, duration=?, quick_hash=?, exif=?, meta_state=1,
+                    date_source = CASE WHEN ? IS NOT NULL THEN 0 ELSE date_source END WHERE id=?
                     """, m.width, m.height, m.orientation, m.takenAt?.timeIntervalSince1970, m.lat, m.lon,
-                           m.camera, m.duration, m.quickHash, m.exif, id)
+                           m.camera, m.duration, m.quickHash, m.exif, m.takenAt?.timeIntervalSince1970, id)
             }
         }
     }
 
     func markThumbs(_ results: [(Int64, ThumbnailStore.Outcome)]) throws {
         try db.transaction {
-            for (id, r) in results { try db.run("UPDATE media SET thumb_state=? WHERE id=?", r.rawValue, id) }
+            let now = Date().timeIntervalSince1970
+            for (id, r) in results {
+                // indexed_at: when the item became visible (Library ▸ Last indexed).
+                try db.run("UPDATE media SET thumb_state = ?, indexed_at = CASE WHEN ? = 1 THEN ? ELSE indexed_at END WHERE id = ?",
+                           r.rawValue, r.rawValue, now, id)
+            }
         }
     }
 
@@ -153,9 +159,16 @@ extension Library {
 
     /// Redo face detection everywhere: drops unnamed Vision faces and all prints, keeps named faces
     /// and Picasa/manual rectangles (their prints are recomputed).
-    public func resetFaces() throws -> Int {
+    /// Faces a human named, ignored, confirmed or rejected (faces.human) are kept with their decision
+    /// unless `includeManual`, which drops every Vision face and every decision on the others.
+    public func resetFaces(includeManual: Bool = false) throws -> Int {
         try db.transaction {
-            try db.run("DELETE FROM faces WHERE source = ? AND person_id IS NULL", FaceSource.vision.rawValue)
+            if includeManual {
+                try db.run("DELETE FROM faces WHERE source = ?", FaceSource.vision.rawValue)
+                try db.run("UPDATE faces SET ignored = 0, rejected_person_id = NULL, human = 0 WHERE source != ?", FaceSource.picasa.rawValue)
+            } else {
+                try db.run("DELETE FROM faces WHERE source = ? AND human = 0", FaceSource.vision.rawValue)
+            }
             try db.run("UPDATE faces SET print = NULL, suggested_person_id = NULL")
             try db.run("UPDATE media SET face_state = 0 WHERE kind != 1")
             return db.changes
@@ -171,19 +184,53 @@ extension Library {
     /// longest side < `minSize`, or < `thumbSize` without camera metadata (typical of thumbnails
     /// written by other apps; small old camera/phone photos have EXIF and are kept). 0 disables a rule.
     /// Re-evaluated on every run, so changing the thresholds takes effect without rescanning.
-    public func classifySmall(minSize: Int, thumbSize: Int) throws -> Int {
+    public func classifySmall(minSize: Int, thumbSize: Int, ids: [Int64]? = nil) throws -> Int {
         try db.run("""
             UPDATE media SET ignored = CASE
               WHEN kind = 0 AND width IS NOT NULL AND height IS NOT NULL
                AND (max(width, height) < ? OR (max(width, height) < ? AND exif = 0)) THEN 1 ELSE 0 END
-            WHERE meta_state IN (1, 2)
+            WHERE meta_state IN (1, 2)\(Self.idList(ids))
             """, minSize, thumbSize)
         return Int(try db.scalar("SELECT count(*) FROM media WHERE ignored = 1") ?? 0)
     }
 
-    /// Files whose date could not be read fall back to their modification time.
-    func fillMissingDates() throws {
-        try db.run("UPDATE media SET taken_at = mtime WHERE taken_at IS NULL AND meta_state IN (1, 2)")
+    /// Files without a date in their metadata get one estimated from their name, their folders, or
+    /// else the file date (DateGuess), recorded in date_source so the UI can say it is an estimate.
+    func fillMissingDates(ids: [Int64]? = nil) throws {
+        var rows: [(Int64, String, String, Double)] = []
+        try db.query("""
+            SELECT m.id, m.name, f.path, m.mtime FROM media m JOIN folders f ON f.id = m.folder_id
+            WHERE m.meta_state IN (1, 2) AND (m.taken_at IS NULL OR m.date_source = -1
+                   OR (m.date_source IS NULL AND m.taken_at = m.mtime)) -- older builds: file date, unmarked\(Self.idList(ids).replacingOccurrences(of: " id IN", with: " m.id IN"))
+            """) { rows.append(($0.int(0), $0.text(1), $0.text(2), $0.double(3))) }
+        guard !rows.isEmpty else { return }
+        try db.transaction {
+            for (id, name, folder, mtime) in rows {
+                let g = DateGuess.guess(name: name, folderPath: folder, fileDate: mtime > 0 ? Date(timeIntervalSince1970: mtime) : nil)
+                try db.run("UPDATE media SET taken_at = ?, date_source = ? WHERE id = ?", g?.0.timeIntervalSince1970, g?.1.rawValue, id)
+            }
+        }
+    }
+
+    static func idList(_ ids: [Int64]?) -> String {
+        guard let ids else { return "" }
+        return " AND id IN (\(ids.isEmpty ? "NULL" : ids.map(String.init).joined(separator: ",")))"
+    }
+}
+
+/// A disk or network share went away during a run. Nothing of the batch was marked unreadable:
+/// the run stops, and starting it again once the disk is back carries on where it was.
+public struct VolumeUnavailable: Error, CustomStringConvertible {
+    public let folder: String
+    public var description: String {
+        "\(folder) is no longer reachable (disk unmounted or network share disconnected). Stopped without marking anything; run again once it is back."
+    }
+
+    /// Items that failed because their folder vanished (the disk, not the file, is the problem).
+    static func check(_ failed: [URL]) throws {
+        if let u = failed.first(where: { !FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().path) }) {
+            throw VolumeUnavailable(folder: u.deletingLastPathComponent().path)
+        }
     }
 }
 
@@ -191,12 +238,16 @@ extension Library {
 public struct Indexer: Sendable {
     public let library: Library
     public var concurrency: Int
-    public var batch = 256
+    /// Defaults from Tools/bench-index.swift --real on a NAS: 4 parallel reads reach the share's
+    /// throughput (~5–6 photos/s, CPU ~15 %); batches of 8 keep it while committing every 1–2 s,
+    /// so new photos show up continuously.
+    public static let defaultConcurrency = 4
+    public var batch = 8
     /// See `Library.classifySmall`.
     public var minSize = 200
     public var thumbSize = 512
 
-    public init(library: Library, concurrency: Int = ProcessInfo.processInfo.activeProcessorCount) {
+    public init(library: Library, concurrency: Int = Indexer.defaultConcurrency) {
         self.library = library
         self.concurrency = max(1, concurrency)
     }
@@ -210,6 +261,7 @@ public struct Indexer: Sendable {
             let results = await parallelMap(work, concurrency: concurrency) { item in
                 (item.id, await MetadataReader.read(url: item.url, kind: item.kind))
             }
+            try VolumeUnavailable.check(zip(work, results).filter { $0.1.1 == nil }.map(\.0.url))
             try await library.store(metadata: results)
             done += results.count
             progress?(LibraryProgress(stage: "metadata", done: done, total: nil, current: work.last?.url.path))
@@ -217,6 +269,45 @@ public struct Indexer: Sendable {
         try await library.fillMissingDates()
         _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize)
         return done
+    }
+
+    /// Metadata and thumbnails batch by batch, so photos become visible (both are needed) all along
+    /// the run instead of only once every file's metadata has been read.
+    public func run(progress: ProgressHandler? = nil) async throws -> (metadata: Int, thumbnails: Int) {
+        try await library.fillMissingDates() // dates left to (re-)estimate by an earlier version
+        try await library.retryUnreadable("meta_state")
+        try await library.retryUnreadable("thumb_state")
+        var (m, t) = (0, 0)
+        let store = library.thumbs
+        while true {
+            let metaWork = try await library.pending(stateColumn: "meta_state", limit: batch)
+            if !metaWork.isEmpty {
+                let results = await parallelMap(metaWork, concurrency: concurrency) { item in
+                    (item.id, await MetadataReader.read(url: item.url, kind: item.kind))
+                }
+                try VolumeUnavailable.check(zip(metaWork, results).filter { $0.1.1 == nil }.map(\.0.url))
+                try await library.store(metadata: results)
+                let ids = metaWork.map(\.id)
+                try await library.fillMissingDates(ids: ids)
+                _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize, ids: ids)
+                m += results.count
+                progress?(LibraryProgress(stage: "metadata", done: m, total: nil, current: metaWork.last?.url.path))
+            }
+            let thumbWork = try await library.pending(stateColumn: "thumb_state", limit: batch, metadataRead: true)
+            if !thumbWork.isEmpty {
+                let results = await parallelMap(thumbWork, concurrency: concurrency) { item in
+                    (item.id, await store.generate(id: item.id, url: item.url, kind: item.kind))
+                }
+                try VolumeUnavailable.check(zip(thumbWork, results).filter { $0.1.1 != .done }.map(\.0.url))
+                try await library.markThumbs(results)
+                t += results.count
+                progress?(LibraryProgress(stage: "thumbnails", done: t, total: nil, current: thumbWork.last?.url.path))
+            }
+            if metaWork.isEmpty && thumbWork.isEmpty { break }
+        }
+        try await library.fillMissingDates()
+        _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize)
+        return (m, t)
     }
 
     public func generateThumbnails(progress: ProgressHandler? = nil) async throws -> Int {
@@ -229,6 +320,7 @@ public struct Indexer: Sendable {
             let results = await parallelMap(work, concurrency: concurrency) { item in
                 (item.id, await store.generate(id: item.id, url: item.url, kind: item.kind))
             }
+            try VolumeUnavailable.check(zip(work, results).filter { $0.1.1 != .done }.map(\.0.url))
             try await library.markThumbs(results)
             done += results.count
             progress?(LibraryProgress(stage: "thumbnails", done: done, total: nil, current: work.last?.url.path))

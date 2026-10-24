@@ -17,6 +17,8 @@ public struct MediaItem: Sendable, Identifiable, Hashable {
     public let lon: Double?
     public let camera: String?
     public let size: Int64
+    /// Where `takenAt` comes from; anything but `.metadata` is an estimate.
+    public var dateSource: DateSource? = nil
     public var url: URL { URL(fileURLWithPath: path) }
 }
 
@@ -49,6 +51,7 @@ public struct FaceRecord: Sendable, Identifiable, Hashable {
     public let personId: Int64?
     public let suggestedPersonId: Int64?
     public let personName: String?
+    public var ignored = false
 }
 
 /// A structured search criterion (a search token in the UI). Several are combined with AND.
@@ -87,6 +90,50 @@ public struct LabelSummary: Sendable, Identifiable, Hashable {
     }
 }
 
+/// A geotagged photo, as plotted on the map.
+public struct GeoPoint: Sendable, Hashable {
+    public let id: Int64
+    public let lat: Double
+    public let lon: Double
+    /// Used to pick a cluster's cover (best-looking photo).
+    public let score: Double
+    public init(id: Int64, lat: Double, lon: Double, score: Double) {
+        self.id = id; self.lat = lat; self.lon = lon; self.score = score
+    }
+}
+
+/// Photos close together on screen, drawn as one pin.
+public struct GeoCluster: Sendable, Identifiable, Hashable {
+    public var id: String
+    public let lat: Double
+    public let lon: Double
+    public let count: Int
+    public let coverId: Int64
+    public let ids: [Int64]
+
+    /// Groups `points` inside the visible box into a grid of about `cells` cells across the larger span.
+    /// Pure and fast (one pass), so it can run on every map move even with 100k+ points.
+    public static func cluster(_ points: [GeoPoint], latRange: ClosedRange<Double>, lonRange: ClosedRange<Double>, cells: Double = 10) -> [GeoCluster] {
+        let size = max(latRange.upperBound - latRange.lowerBound, lonRange.upperBound - lonRange.lowerBound, 1e-6) / cells
+        struct Acc { var lat = 0.0, lon = 0.0, n = 0, best = -Double.infinity, cover: Int64 = 0, ids: [Int64] = [] }
+        struct Cell: Hashable { let y, x: Int }
+        var acc: [Cell: Acc] = [:]
+        for p in points where latRange.contains(p.lat) && lonRange.contains(p.lon) {
+            let key = Cell(y: Int((p.lat / size).rounded(.down)), x: Int((p.lon / size).rounded(.down)))
+            // Mutated in place: copying the cell out and back made every append copy its id list
+            // (quadratic, a freeze on cells of thousands of photos).
+            acc[key, default: Acc()].lat += p.lat
+            acc[key]!.lon += p.lon
+            acc[key]!.n += 1
+            acc[key]!.ids.append(p.id)
+            if p.score > acc[key]!.best { acc[key]!.best = p.score; acc[key]!.cover = p.id }
+        }
+        return acc.map { k, a in
+            GeoCluster(id: "\(k.y):\(k.x)", lat: a.lat / Double(a.n), lon: a.lon / Double(a.n), count: a.n, coverId: a.cover, ids: a.ids)
+        }.sorted { $0.count > $1.count }
+    }
+}
+
 /// What the grid shows.
 public enum MediaFilter: Sendable, Hashable {
     case all
@@ -103,6 +150,16 @@ public enum MediaFilter: Sendable, Hashable {
     /// Photos that have near-duplicates or exact duplicates, grouped together.
     case similar
     case animals
+    /// Most recently indexed (Library ▸ Last indexed), newest first.
+    case recent
+    /// Identical files: the copy kept and its copies (Discover ▸ Duplicates).
+    case duplicates
+    /// Dates estimated from a file or folder name, or the file date (Discover ▸ Estimated dates).
+    case estimatedDates
+    case pet(Int64)
+    case petSuggestions(Int64)
+    /// People / Animals "Photos" view: photos with named, unnamed and/or ignored faces (or animals).
+    case identities(IdentityKind, named: Bool, unnamed: Bool, ignored: Bool, year: Int?)
     /// Screenshots, receipts, documents (Vision "utility" images).
     case utility
     /// Small images set aside as probable thumbnails of other apps.
@@ -118,7 +175,7 @@ public enum MediaFilter: Sendable, Hashable {
 extension Library {
     static let mediaColumns = """
         m.id, f.path || '/' || m.name, m.name, m.kind, m.width, m.height, m.taken_at, m.star, m.caption,
-        m.rotate, m.duration, m.lat, m.lon, m.camera, m.size
+        m.rotate, m.duration, m.lat, m.lon, m.camera, m.size, m.date_source
         """
 
     static func item(_ r: Database.Row) -> MediaItem {
@@ -126,7 +183,8 @@ extension Library {
                   width: r.optInt(4).map(Int.init), height: r.optInt(5).map(Int.init),
                   takenAt: r.optDouble(6).map { Date(timeIntervalSince1970: $0) }, star: r.int(7) != 0,
                   caption: r.optText(8), rotate: Int(r.int(9)), duration: r.optDouble(10),
-                  lat: r.optDouble(11), lon: r.optDouble(12), camera: r.optText(13), size: r.int(14))
+                  lat: r.optDouble(11), lon: r.optDouble(12), camera: r.optText(13), size: r.int(14),
+                  dateSource: r.optInt(15).flatMap { DateSource(rawValue: Int($0)) })
     }
 
     func whereClause(_ f: MediaFilter) -> (String, [SQLBindable]) {
@@ -146,6 +204,19 @@ extension Library {
                 """, [])
         case .similar: return ("m.id IN (SELECT media_id FROM similar)", [])
         case .animals: return ("m.id IN (SELECT media_id FROM animals)", [])
+        case .recent: return ("m.indexed_at IS NOT NULL", [])
+        case .duplicates: return ("(m.dup_of IS NOT NULL OR m.id IN (SELECT group_id FROM group_info WHERE kind = 0))", [])
+        case .estimatedDates: return ("m.date_source IN (1, 2, 3)", [])
+        case let .pet(id): return ("m.id IN (SELECT media_id FROM animals WHERE pet_id = ?)", [id])
+        case let .petSuggestions(id): return ("m.id IN (SELECT media_id FROM animals WHERE pet_id IS NULL AND suggested_pet_id = ?)", [id])
+        case let .identities(k, named, unnamed, ignored, year):
+            var kinds: [String] = []
+            if named { kinds.append("(t.\(k.col) IS NOT NULL AND t.ignored = 0)") }
+            if unnamed { kinds.append("(t.\(k.col) IS NULL AND t.ignored = 0)") }
+            if ignored { kinds.append("t.ignored = 1") }
+            guard !kinds.isEmpty else { return ("0", []) }
+            let (yc, ya) = yearClause(year)
+            return ("m.id IN (SELECT t.media_id FROM \(k.table) t WHERE \(kinds.joined(separator: " OR ")))" + yc, ya)
         case .utility: return ("m.utility = 1", [])
         case .ignored: return ("m.ignored = 1", [])
         case .bursts: return ("m.id IN (SELECT media_id FROM bursts)", [])
@@ -160,8 +231,7 @@ extension Library {
             }
             return (parts.isEmpty ? "1" : parts.joined(separator: " AND "), args)
         case let .year(y):
-            let start = DateComponents(calendar: .current, year: y).date!.timeIntervalSince1970
-            let end = DateComponents(calendar: .current, year: y + 1).date!.timeIntervalSince1970
+            let (start, end) = Self.yearRange(y)
             return ("m.taken_at >= ? AND m.taken_at < ?", [start, end])
         case let .search(q): return textClause(q)
         }
@@ -187,10 +257,11 @@ extension Library {
              OR m.id IN (SELECT media_id FROM tags WHERE tag LIKE ?)
              OR m.id IN (SELECT media_id FROM labels WHERE label LIKE ?)
              OR m.id IN (SELECT media_id FROM animals WHERE species LIKE ?)
+             OR m.id IN (SELECT a.media_id FROM animals a JOIN pets p ON p.id = a.pet_id WHERE p.name LIKE ?)
              OR m.id IN (SELECT fa.media_id FROM faces fa JOIN persons p ON p.id = fa.person_id WHERE p.name LIKE ?)
              OR m.id IN (SELECT ai.media_id FROM album_items ai JOIN albums a ON a.id = ai.album_id WHERE a.name LIKE ?))
             """
-        return (clause, Array(repeating: like, count: 9))
+        return (clause, Array(repeating: like, count: 10))
     }
 
     /// Every label and keyword with its photo count and the best-looking photo as cover, most used first.
@@ -211,7 +282,7 @@ extension Library {
     public func searchVocabulary() throws -> [SearchTerm] {
         var out: [SearchTerm] = []
         out += try db.all("""
-            SELECT p.id, p.name FROM persons p WHERE p.name != ''
+            SELECT p.id, p.name FROM persons p WHERE p.name != '' AND p.merged_into IS NULL
             ORDER BY (SELECT count(*) FROM faces WHERE person_id = p.id) DESC
             """) { .person($0.int(0), $0.text(1)) }
         out += try db.all("""
@@ -231,7 +302,7 @@ extension Library {
         let (lp, li) = (prefix.replacingOccurrences(of: " ", with: "_"), inner.replacingOccurrences(of: " ", with: "_"))
         var out: [SearchTerm] = []
         out += try db.all("""
-            SELECT p.id, p.name FROM persons p WHERE p.name != '' AND p.name LIKE ?
+            SELECT p.id, p.name FROM persons p WHERE p.name != '' AND p.merged_into IS NULL AND p.name LIKE ?
             ORDER BY p.name NOT LIKE ?, (SELECT count(*) FROM faces WHERE person_id = p.id) DESC LIMIT 5
             """, [inner, prefix]) { .person($0.int(0), $0.text(1)) }
         out += try db.all("""
@@ -246,27 +317,45 @@ extension Library {
     }
 
     /// Media ids for a filter, newest first. Ids are cheap (8 bytes each) so even 1M items fit; rows are loaded per page.
-    public func mediaIds(_ filter: MediaFilter) throws -> [Int64] {
+    public func mediaIds(_ filter: MediaFilter) throws -> [Int64] { try mediaIdsAndYears(filter).map(\.id) }
+
+    /// Same as `mediaIds`, with each item's year (0 = undated), for year sections in the grids.
+    public func mediaIdsAndYears(_ filter: MediaFilter) throws -> [(id: Int64, year: Int)] {
         var (w, args) = whereClause(filter)
+        let row: (Database.Row) -> (id: Int64, year: Int) = { ($0.int(0), Int($0.int(1))) }
+        let year = "coalesce(CAST(strftime('%Y', m.taken_at, 'unixepoch', 'localtime') AS INTEGER), 0)"
         if case .folder = filter {} else { w = "(\(w)) AND m.hidden = 0" } // Picasa-hidden photos only show in their folder
-        if case .ignored = filter {} else { w = "(\(w)) AND m.ignored = 0" }
-        if case .bursts = filter {
-            // Each burst in shooting order; bursts newest first.
+        // Only indexed items (metadata read and thumbnail made): the rest appear as the indexer gets to them.
+        if case .ignored = filter {} else { w = "(\(w)) AND m.ignored = 0 AND m.meta_state = 1 AND m.thumb_state = 1" }
+        // Copies of identical files are hidden, except in their folder and in Duplicates.
+        switch filter { case .folder, .duplicates, .ignored: break; default: w += " AND m.dup_of IS NULL" }
+        // Grouped views: the precomputed groups, flattened (the app shows one cover per group).
+        let grouped: GroupKind? = { switch filter { case .bursts: .burst; case .similar: .similar; case .duplicates: .duplicates; default: nil } }()
+        if let k = grouped { return try mediaGroups(k).flatMap(\.members).map { ($0, 0) } }
+        if case .recent = filter {
             return try db.all("""
-                SELECT m.id FROM media m JOIN folders f ON f.id = m.folder_id JOIN bursts b ON b.media_id = m.id
-                WHERE \(w) ORDER BY (SELECT max(m2.taken_at) FROM bursts b2 JOIN media m2 ON m2.id = b2.media_id WHERE b2.burst_id = b.burst_id) DESC,
-                  b.burst_id, b.position
-                """, args) { $0.int(0) }
+                SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w)
+                ORDER BY m.indexed_at DESC, m.id DESC LIMIT 2000
+                """, args, row)
         }
         if case .similar = filter {
             // Group members next to each other, best-looking first; groups newest first.
             return try db.all("""
-                SELECT m.id FROM media m JOIN folders f ON f.id = m.folder_id JOIN similar s ON s.media_id = m.id
+                SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id JOIN similar s ON s.media_id = m.id
                 WHERE \(w) ORDER BY (SELECT max(m2.taken_at) FROM similar s2 JOIN media m2 ON m2.id = s2.media_id WHERE s2.group_id = s.group_id) DESC,
                   s.group_id, m.aesthetic DESC, m.size DESC
-                """, args) { $0.int(0) }
+                """, args, row)
         }
-        return try db.all("SELECT m.id FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w) ORDER BY m.taken_at DESC, m.id DESC", args) { $0.int(0) }
+        return try db.all("SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w) ORDER BY m.taken_at DESC, m.id DESC", args, row)
+    }
+
+    /// Every geotagged, visible photo or video (newest first).
+    public func geoPoints() throws -> [GeoPoint] {
+        try db.all("""
+            SELECT id, lat, lon, coalesce(aesthetic, 0) FROM media
+            WHERE lat IS NOT NULL AND lon IS NOT NULL AND (lat != 0 OR lon != 0) AND ignored = 0 AND hidden = 0
+            ORDER BY taken_at DESC
+            """) { GeoPoint(id: $0.int(0), lat: $0.double(1), lon: $0.double(2), score: $0.double(3)) }
     }
 
     public func items(ids: [Int64]) throws -> [MediaItem] {
@@ -280,6 +369,7 @@ extension Library {
     public func folders() throws -> [FolderNode] {
         try db.all("""
             SELECT f.id, f.path, count(m.id) FROM folders f JOIN media m ON m.folder_id = f.id
+            WHERE m.meta_state = 1 AND m.thumb_state = 1 AND m.ignored = 0
             GROUP BY f.id ORDER BY max(m.taken_at) DESC
             """) { r in
             let path = r.text(1)
@@ -288,20 +378,12 @@ extension Library {
     }
 
     public func years() throws -> [(year: Int, count: Int)] {
-        try db.all("SELECT CAST(strftime('%Y', taken_at, 'unixepoch', 'localtime') AS INTEGER) y, count(*) FROM media WHERE taken_at IS NOT NULL GROUP BY y ORDER BY y DESC") {
+        try db.all("SELECT CAST(strftime('%Y', taken_at, 'unixepoch', 'localtime') AS INTEGER) y, count(*) FROM media WHERE taken_at IS NOT NULL AND meta_state = 1 AND thumb_state = 1 AND ignored = 0 AND hidden = 0 AND dup_of IS NULL GROUP BY y ORDER BY y DESC") {
             (Int($0.int(0)), Int($0.int(1)))
         }
     }
 
-    public func persons() throws -> [PersonSummary] {
-        try db.all("""
-            SELECT p.id, p.name,
-              (SELECT count(*) FROM faces WHERE person_id = p.id),
-              (SELECT count(*) FROM faces WHERE person_id IS NULL AND suggested_person_id = p.id),
-              (SELECT id FROM faces WHERE person_id = p.id ORDER BY w DESC LIMIT 1)
-            FROM persons p WHERE p.name != '' ORDER BY 3 DESC
-            """) { PersonSummary(id: $0.int(0), name: $0.text(1), faces: Int($0.int(2)), suggestions: Int($0.int(3)), coverFaceId: $0.optInt(4)) }
-    }
+    public func persons() throws -> [PersonSummary] { try owners(.face) }
 
     public func albums() throws -> [AlbumSummary] {
         try db.all("SELECT a.id, a.name, count(ai.media_id) FROM albums a LEFT JOIN album_items ai ON ai.album_id = a.id GROUP BY a.id ORDER BY a.name") {
@@ -309,22 +391,9 @@ extension Library {
         }
     }
 
-    public func faces(mediaId: Int64) throws -> [FaceRecord] {
-        try db.all("""
-            SELECT fa.id, fa.media_id, fa.x, fa.y, fa.w, fa.h, fa.person_id, fa.suggested_person_id, p.name
-            FROM faces fa LEFT JOIN persons p ON p.id = coalesce(fa.person_id, fa.suggested_person_id) WHERE fa.media_id = ?
-            """, [mediaId]) {
-            FaceRecord(id: $0.int(0), mediaId: $0.int(1), x: $0.double(2), y: $0.double(3), w: $0.double(4), h: $0.double(5),
-                       personId: $0.optInt(6), suggestedPersonId: $0.optInt(7), personName: $0.optText(8))
-        }
-    }
+    public func faces(mediaId: Int64) throws -> [FaceRecord] { try regions(.face, mediaId: mediaId) }
 
-    public func face(id: Int64) throws -> FaceRecord? {
-        try db.all("SELECT id, media_id, x, y, w, h, person_id, suggested_person_id, NULL FROM faces WHERE id = ?", [id]) {
-            FaceRecord(id: $0.int(0), mediaId: $0.int(1), x: $0.double(2), y: $0.double(3), w: $0.double(4), h: $0.double(5),
-                       personId: $0.optInt(6), suggestedPersonId: $0.optInt(7), personName: nil)
-        }.first
-    }
+    public func face(id: Int64) throws -> FaceRecord? { try region(.face, id: id) }
 
     public func tags(mediaId: Int64) throws -> [String] {
         try db.all("SELECT tag FROM tags WHERE media_id = ? ORDER BY tag", [mediaId]) { $0.text(0) }
@@ -364,20 +433,33 @@ extension Library {
     @discardableResult
     public func nameFace(_ faceId: Int64, name: String) throws -> Int64 {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        var pid = try db.scalar("SELECT id FROM persons WHERE name = ? COLLATE NOCASE", [trimmed])
+        var pid = try db.scalar("SELECT coalesce(merged_into, id) FROM persons WHERE name = ? COLLATE NOCASE ORDER BY merged_into IS NOT NULL LIMIT 1", [trimmed])
         if pid == nil { pid = try db.run("INSERT INTO persons(name) VALUES(?)", trimmed) }
         // Named by the user: `manual`, so a later .picasa.ini re-import does not replace it.
-        try db.run("UPDATE faces SET person_id = ?, suggested_person_id = NULL, source = ? WHERE id = ?", pid!, FaceSource.manual.rawValue, faceId)
+        try db.run("UPDATE faces SET person_id = ?, suggested_person_id = NULL, source = ?, human = 1, human_at = ? WHERE id = ?", pid!, FaceSource.manual.rawValue, Date().timeIntervalSince1970, faceId)
         return pid!
     }
 
     /// Accepts all current suggestions for a person.
-    public func confirmSuggestions(personId: Int64) throws -> Int {
-        try db.run("UPDATE faces SET person_id = suggested_person_id, suggested_person_id = NULL WHERE person_id IS NULL AND suggested_person_id = ?", personId)
-        return db.changes
-    }
+    public func confirmSuggestions(personId: Int64) throws -> Int { try confirm(.face, owner: personId) }
 
     public func rejectSuggestion(faceId: Int64) throws {
-        try db.run("UPDATE faces SET rejected_person_id = suggested_person_id, suggested_person_id = NULL WHERE id = ?", faceId)
+        try db.run("UPDATE faces SET rejected_person_id = suggested_person_id, suggested_person_id = NULL, human = 1, human_at = ? WHERE id = ?", Date().timeIntervalSince1970, faceId)
+    }
+
+    /// Confirms a person's suggested faces in the given photos (user action → `manual`).
+    @discardableResult
+    public func confirmSuggestions(personId: Int64, mediaIds: [Int64]) throws -> Int { try confirm(.face, owner: personId, mediaIds: mediaIds) }
+
+    /// Rejects a person's suggested faces in the given photos; remembered so they are not proposed again.
+    @discardableResult
+    public func rejectSuggestions(personId: Int64, mediaIds: [Int64]) throws -> Int { try reject(.face, owner: personId, mediaIds: mediaIds) }
+
+    /// Confirms one suggested face.
+    public func confirmSuggestion(faceId: Int64) throws {
+        try db.run("""
+            UPDATE faces SET person_id = suggested_person_id, suggested_person_id = NULL, source = ?, human = 1
+            WHERE id = ? AND suggested_person_id IS NOT NULL
+            """, FaceSource.manual.rawValue, faceId)
     }
 }

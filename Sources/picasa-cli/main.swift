@@ -14,16 +14,36 @@ commands:
   remove-root PATH        forget a root and its index (photos untouched)
   excludes                list remembered exclusions
   unexclude NAME|/PATH    forget an exclusion (rescan to index that folder again)
-  index [--redo-thumbs] [--min-size N] [--thumb-size N]
-                          extract metadata + generate thumbnails for pending items
+  index [--redo-thumbs] [--min-size N] [--thumb-size N] [--batch N]
+                          extract metadata + generate thumbnails for pending items, batch by batch
+                          (default 4 parallel reads (-j) and batches of 8: measured on a NAS, more
+                          reads do not go faster and smaller batches lose throughput)
                           (--redo-thumbs: regenerate every thumbnail). Small images are ignored:
                           longest side < --min-size (200), or < --thumb-size (512) without camera
                           EXIF (other apps' thumbnails). 0 disables a rule
-  analyze [--redo]        one Vision pass on pending images: faces, labels, animals, aesthetics,
-                          similar-photo prints; then name suggestions and similar groups
-                          (--redo: redo everywhere; named faces are kept). Alias: faces
+  analyze [--redo [--include-manual]] [--batch N]
+                          one Vision pass on pending images: faces, labels, animals (+ a print per
+                          animal, to recognise pets), aesthetics, similar-photo prints; then name
+                          suggestions for people and pets, and similar groups
+                          (--redo: redo everywhere, keeping what a human decided on faces and
+                          animals: names, ignores, confirmations, rejections; --include-manual
+                          drops those decisions too). Batches of 8 by default. Alias: faces
   import-contacts FILE    import Picasa contacts.xml (person names)
   import-db3 DIR          import a Picasa db3 folder (captions, stars, faces); --no-thumbs to skip its thumbnails
+  export [--format picasa|xmp|all] [--dry-run] [PATH]
+                          write the library's edits next to the photos (opt-in; nothing else ever writes there).
+                          picasa (default): stars, captions, named faces (+ contacts), keywords, albums into
+                            each folder's .picasa.ini (previous file kept as .picasa.ini.bak; rotate/filters
+                            and unknown keys kept)
+                          xmp: one IMG_0001.xmp sidecar per photo: rating, caption, keywords, people and pets
+                            as named regions (MWG) and People|/Pets|/Albums| keywords. Sidecars made by
+                            other programs are left alone
+                          PATH limits it to one folder tree. Alias: export-ini
+  merge-duplicates [--apply]
+                          people (pets) with the same name (case, accents, spaces ignored), e.g. one
+                          person imported from several Picasa contacts: listed, merged with --apply
+                          into the one with the most photos
+  suggest                 recompute name suggestions for faces and animals (no file is read)
   stats                   library summary
   similar [--threshold T] rebuild bursts and similar/duplicate groups (T: cosine, saved; default 0.97)
   all ROOT...             scan + index + analyze
@@ -35,6 +55,7 @@ default library: ~/Library/Application Support/PicasaNext Library
 var args = Array(CommandLine.arguments.dropFirst())
 var libraryURL = Library.defaultURL
 var jobs = ProcessInfo.processInfo.activeProcessorCount
+var jobsGiven = false
 
 @MainActor func value(for option: String) -> String {
     guard !args.isEmpty else { FileHandle.standardError.write("\(option) needs a value\n".data(using: .utf8)!); exit(2) }
@@ -44,7 +65,7 @@ while let first = args.first, first.hasPrefix("-") {
     args.removeFirst()
     switch first {
     case "--library", "-l": libraryURL = URL(fileURLWithPath: (value(for: first) as NSString).expandingTildeInPath)
-    case "-j": jobs = max(1, Int(value(for: first)) ?? jobs)
+    case "-j": jobs = max(1, Int(value(for: first)) ?? jobs); jobsGiven = true
     case "-h", "--help": print(usage); exit(0)
     default: FileHandle.standardError.write("unknown option \(first)\n".data(using: .utf8)!); exit(2)
     }
@@ -63,7 +84,7 @@ func split(_ a: [String], options: Set<String>) -> (positional: [String], values
     }
     return (pos, vals)
 }
-let parsed = split(rest, options: ["--exclude", "--min-size", "--thumb-size", "--threshold"])
+let parsed = split(rest, options: ["--exclude", "--min-size", "--thumb-size", "--threshold", "--batch"])
 
 /// One-line, rate-limited progress on stderr.
 final class Ticker: @unchecked Sendable {
@@ -103,24 +124,30 @@ final class Ticker: @unchecked Sendable {
     }
     func index() async throws {
         if rest.contains("--redo-thumbs") { print("thumbnails: \(try await library.resetThumbnails()) marked for regeneration") }
-        var indexer = Indexer(library: library, concurrency: jobs)
+        var indexer = Indexer(library: library, concurrency: jobsGiven ? jobs : Indexer.defaultConcurrency)
+        if let v = parsed.values["--batch"]?.last.flatMap(Int.init) { indexer.batch = max(1, v) }
         if let v = parsed.values["--min-size"]?.last.flatMap(Int.init) { indexer.minSize = v }
         if let v = parsed.values["--thumb-size"]?.last.flatMap(Int.init) { indexer.thumbSize = v }
-        let m = try await indexer.extractMetadata { tick($0) }
-        tick.end(); print("metadata: \(m) items (\(elapsed()))")
-        let t = try await indexer.generateThumbnails { tick($0) }
-        tick.end(); print("thumbnails: \(t) items (\(elapsed()))")
+        let r = try await indexer.run { tick($0) }
+        tick.end(); print("index: metadata \(r.metadata) · thumbnails \(r.thumbnails) items (\(elapsed()))")
     }
     func analyze() async throws {
         if rest.contains("--redo") {
-            let n = try await library.resetFaces()
-            _ = try await library.resetAnalysis()
+            let manual = rest.contains("--include-manual")
+            let n = try await library.resetFaces(includeManual: manual)
+            _ = try await library.resetAnalysis(includeManual: manual)
             print("analysis: \(n) images marked for re-analysis")
         }
-        let n = try await Analyzer(library: library, concurrency: max(1, jobs / 2)).run { tick($0) }
+        var analyzer = Analyzer(library: library, concurrency: max(1, jobs / 2))
+        if let v = parsed.values["--batch"]?.last.flatMap(Int.init) { analyzer.batch = max(1, v) }
+        let n = try await analyzer.run { tick($0) }
         tick.end(); print("analysis: \(n) images (\(elapsed()))")
         let s = try await FaceEngine(library: library).suggestNames()
         print("faces: \(s) name suggestions (\(elapsed()))")
+        let p = try await Analyzer(library: library, concurrency: max(1, jobs / 2)).petPrints { tick($0) }
+        tick.end()
+        let ps = try await IdentityEngine.suggest(library: library, kind: .pet, threshold: 0.82)
+        print("pets: \(p) photos printed, \(ps) name suggestions (\(elapsed()))")
         try await similar()
     }
     func similar() async throws {
@@ -169,6 +196,47 @@ final class Ticker: @unchecked Sendable {
         let r = try await library.importDB3(at: URL(fileURLWithPath: (d as NSString).expandingTildeInPath),
                                             reuseThumbnails: !rest.contains("--no-thumbs")) { tick($0) }
         tick.end(); print("db3: \(r)")
+    case "export", "export-ini":
+        var format = "picasa"
+        var dry = false, only: String?
+        var i = 0
+        while i < rest.count {
+            switch rest[i] {
+            case "--format": i += 1; format = i < rest.count ? rest[i] : format
+            case "--dry-run": dry = true
+            default: only = URL(fileURLWithPath: (rest[i] as NSString).expandingTildeInPath).standardizedFileURL.path
+            }
+            i += 1
+        }
+        guard ["picasa", "ini", "xmp", "all"].contains(format) else { print(usage); exit(2) }
+        if format != "xmp" {
+            let r = try await library.exportIni(dryRun: dry, only: only) { tick($0) }
+            tick.end(); print(r)
+            for f in r.failed { print("  failed: \(f.path): \(f.error)") }
+        }
+        if format == "xmp" || format == "all" {
+            let r = try await library.exportXmp(dryRun: dry, only: only) { tick($0) }
+            tick.end(); print(r)
+            for f in r.failed { print("  failed: \(f.path): \(f.error)") }
+        }
+    case "suggest":
+        let f = try await FaceEngine(library: library).suggestNames()
+        let p = try await IdentityEngine.suggest(library: library, kind: .pet, threshold: 0.82)
+        print("suggestions: \(f) faces, \(p) animals (\(elapsed()))")
+    case "merge-duplicates":
+        for k in [IdentityKind.face, .pet] {
+            let groups = try await library.duplicateOwners(k)
+            for g in groups {
+                print("\(k == .face ? "person" : "pet") “\(g[0].name)”: " + g.map { "#\($0.id) (\($0.faces) photos)" }.joined(separator: " + ")
+                      + " → #\(g[0].id)")
+            }
+            if rest.contains("--apply") {
+                print("merged \(try await library.mergeDuplicates(k, groups)) \(k == .face ? "people" : "pets")")
+            } else if !groups.isEmpty {
+                print("(dry run: add --apply to merge)")
+            }
+        }
+        if rest.contains("--apply") { _ = try await FaceEngine(library: library).suggestNames() }
     case "stats": break
     default: print(usage); exit(2)
     }

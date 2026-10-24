@@ -54,33 +54,73 @@ public struct FaceEngine: Sendable {
     /// (cosine similarity to the person's centroid) when above the threshold and not rejected
     /// by the user for that face. Returns suggestions made.
     public func suggestNames() async throws -> Int {
-        let (persons, centroids, dim) = try await library.personCentroids()
+        try await IdentityEngine.suggest(library: library, kind: .face, threshold: suggestThreshold)
+    }
+}
+
+/// Name suggestions shared by faces and pets: each unnamed item goes to the most similar named
+/// one (cosine similarity to its centroid) when above the threshold and not rejected for it.
+public enum IdentityEngine {
+    /// How much closer to a known counter-example than to the person's average face a face must be
+    /// for that person to be ruled out.
+    static let counterMargin: Float = 0
+
+    /// Suggests a name for every unnamed face (animal): the person whose average face (centroid) is
+    /// the most similar, above `threshold`. Faces a human said were *not* someone (rejected, or taken
+    /// away from them) are counter-examples: a face that looks more like one of them than like the
+    /// person's average is not suggested for that person — so correcting a few wrong suggestions
+    /// also clears their look-alikes — and the next best person is tried instead.
+    public static func suggest(library: Library, kind: IdentityKind, threshold: Float) async throws -> Int {
+        let (persons, centroids, dim) = try await library.centroids(kind)
         guard !persons.isEmpty, dim > 0 else { return 0 }
-        let threshold = suggestThreshold
+        let np = persons.count
+        let column = Dictionary(uniqueKeysWithValues: persons.enumerated().map { ($1, $0) })
         // centroidsᵀ [dim × persons] for vDSP_mmul.
         var centroidsT = [Float](repeating: 0, count: centroids.count)
-        vDSP_mtrans(centroids, 1, &centroidsT, 1, vDSP_Length(dim), vDSP_Length(persons.count))
+        vDSP_mtrans(centroids, 1, &centroidsT, 1, vDSP_Length(dim), vDSP_Length(np))
+        // Counter-examples: prints of faces rejected for a person, with that person.
+        let negatives = try await library.counterExamples(kind, dim: dim).filter { column[$0.owner] != nil }
+        var negT = [Float](repeating: 0, count: negatives.count * dim)
+        if !negatives.isEmpty {
+            vDSP_mtrans(negatives.flatMap(\.print), 1, &negT, 1, vDSP_Length(dim), vDSP_Length(negatives.count))
+        }
         var made = 0
         var after: Int64 = 0
         while true {
-            let batch = try await library.unnamedPrints(after: after, limit: 4096, dim: dim)
-            guard let lastId = try await library.lastUnnamedPrintId(after: after, limit: 4096) else { break }
+            let batch = try await library.unnamedPrints(kind, after: after, limit: 4096, dim: dim)
+            guard let lastId = try await library.lastUnnamedPrintId(kind, after: after, limit: 4096) else { break }
             after = lastId
             if batch.isEmpty { continue }
-            // scores[b × p] = prints[b × d] · centroidsᵀ[d × p]
             let flat = batch.flatMap(\.print)
-            var scores = [Float](repeating: 0, count: batch.count * persons.count)
-            vDSP_mmul(flat, 1, centroidsT, 1, &scores, 1,
-                      vDSP_Length(batch.count), vDSP_Length(persons.count), vDSP_Length(dim))
+            // scores[b × p] = prints[b × d] · centroidsᵀ[d × p]
+            var scores = [Float](repeating: 0, count: batch.count * np)
+            vDSP_mmul(flat, 1, centroidsT, 1, &scores, 1, vDSP_Length(batch.count), vDSP_Length(np), vDSP_Length(dim))
+            // neg[b × n]: similarity to each counter-example.
+            var neg = [Float](repeating: 0, count: batch.count * negatives.count)
+            if !negatives.isEmpty {
+                vDSP_mmul(flat, 1, negT, 1, &neg, 1, vDSP_Length(batch.count), vDSP_Length(negatives.count), vDSP_Length(dim))
+            }
             var updates: [(Int64, Int64?)] = []
             for (i, f) in batch.enumerated() {
-                var best: Float = 0; var idx: vDSP_Length = 0
-                scores.withUnsafeBufferPointer { vDSP_maxvi($0.baseAddress! + i * persons.count, 1, &best, &idx, vDSP_Length(persons.count)) }
-                let pick = persons[Int(idx)]
-                updates.append((f.id, best >= threshold && pick != f.rejected ? pick : nil))
+                // Closest counter-example per person for this face.
+                var worst: [Int: Float] = [:]
+                for (k, n) in negatives.enumerated() {
+                    let v = neg[i * negatives.count + k]
+                    if v > (worst[column[n.owner]!] ?? -1) { worst[column[n.owner]!] = v }
+                }
+                // Best person not ruled out (rejected for this very face, or closer to a counter-example).
+                let row = (0..<np).map { scores[i * np + $0] }
+                var pick: Int64?
+                for p in row.indices.sorted(by: { row[$0] > row[$1] }).prefix(3) {
+                    guard row[p] >= threshold else { break }
+                    if persons[p] == f.rejected { continue }
+                    if let w = worst[p], w >= row[p] + counterMargin { continue }
+                    pick = persons[p]; break
+                }
+                updates.append((f.id, pick))
             }
             made += updates.filter { $0.1 != nil }.count
-            try await library.storeSuggestions(updates)
+            try await library.storeSuggestions(kind, updates)
         }
         return made
     }
@@ -91,92 +131,29 @@ public struct FaceCluster: Sendable, Identifiable, Hashable {
     public var id: Int64 { coverFaceId }
     public let coverFaceId: Int64
     public let faceIds: [Int64]
+    public init(coverFaceId: Int64, faceIds: [Int64]) { self.coverFaceId = coverFaceId; self.faceIds = faceIds }
 }
 
 extension Library {
-    /// Groups unnamed faces without a pending suggestion by feature-print similarity
-    /// (leader clustering: a face joins the first cluster whose leader is within `threshold`).
-    /// Largest faces first, at most `maxFaces` of them, so it stays interactive on huge libraries.
+    /// Unnamed faces grouped by similarity (see `identityClusters`).
     public func unnamedClusters(threshold: Float = 0.8, maxFaces: Int = 5_000) throws -> [FaceCluster] {
-        var faces: [(id: Int64, print: [Float])] = []
-        try db.query("""
-            SELECT id, print FROM faces WHERE person_id IS NULL AND suggested_person_id IS NULL AND print IS NOT NULL
-              AND media_id NOT IN (SELECT id FROM media WHERE ignored = 1)
-            ORDER BY w * h DESC LIMIT ?
-            """, [maxFaces]) { r in
-            if let d = r.blob(1) { faces.append((r.int(0), d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) })) }
-        }
-        guard let dim = faces.first?.print.count, dim > 0 else { return [] }
-        var leaders: [[Float]] = []
-        var members: [[Int64]] = []
-        for f in faces where f.print.count == dim {
-            var best = -1, bestScore: Float = threshold
-            for (i, l) in leaders.enumerated() {
-                var s: Float = 0
-                vDSP_dotpr(f.print, 1, l, 1, &s, vDSP_Length(dim))
-                if s >= bestScore { best = i; bestScore = s }
-            }
-            if best >= 0 { members[best].append(f.id) } else { leaders.append(f.print); members.append([f.id]) }
-        }
-        return members.map { FaceCluster(coverFaceId: $0[0], faceIds: $0) }
-            .sorted { $0.faceIds.count > $1.faceIds.count }
+        try identityClusters(.face, threshold: threshold, maxItems: maxFaces)
     }
 
     /// Names several faces at once (user action → `manual`). Returns the person id.
     @discardableResult
-    public func nameFaces(_ faceIds: [Int64], name: String) throws -> Int64? {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, !faceIds.isEmpty else { return nil }
-        return try db.transaction {
-            var pid = try db.scalar("SELECT id FROM persons WHERE name = ? COLLATE NOCASE", [trimmed])
-            if pid == nil { pid = try db.run("INSERT INTO persons(name) VALUES(?)", trimmed) }
-            for f in faceIds {
-                try db.run("UPDATE faces SET person_id = ?, suggested_person_id = NULL, source = ? WHERE id = ?", pid!, FaceSource.manual.rawValue, f)
-            }
-            return pid
-        }
-    }
+    public func nameFaces(_ faceIds: [Int64], name: String) throws -> Int64? { try nameItems(.face, faceIds, name: name) }
+
+    /// Changes when faces are added, removed, named, suggested or ignored (to skip re-clustering otherwise).
+    public func facesToken() throws -> [Int64] { try identityToken(.face) }
+
+    /// Merges `source` into `target` (Picasa: drop a person onto another).
+    public func mergePerson(_ source: Int64, into target: Int64) throws { try merge(.face, source, into: target) }
+
+    /// Assigns faces to an existing person (drop an unnamed group onto a person), as a user action.
+    public func assignFaces(_ faceIds: [Int64], to personId: Int64) throws { try assign(.face, faceIds, to: personId) }
 
     func mediaPath(_ id: Int64) throws -> String {
         try db.all("SELECT f.path || '/' || m.name FROM media m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?", [id]) { $0.text(0) }.first ?? ""
-    }
-
-    /// Normalized mean print per named person.
-    func personCentroids() throws -> (persons: [Int64], centroids: [Float], dim: Int) {
-        var sums: [Int64: [Float]] = [:]
-        var dim = 0
-        try db.query("SELECT person_id, print FROM faces WHERE person_id IS NOT NULL AND print IS NOT NULL") { r in
-            guard let d = r.blob(1) else { return }
-            let v = d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-            if dim == 0 { dim = v.count }
-            guard v.count == dim else { return }
-            let pid = r.int(0)
-            if var s = sums[pid] { vDSP_vadd(s, 1, v, 1, &s, 1, vDSP_Length(dim)); sums[pid] = s } else { sums[pid] = v }
-        }
-        var persons: [Int64] = [], flat: [Float] = []
-        for (pid, var s) in sums {
-            var n: Float = 0
-            vDSP_svesq(s, 1, &n, vDSP_Length(dim)); n = sqrt(n)
-            if n > 0 { vDSP_vsdiv(s, 1, &n, &s, 1, vDSP_Length(dim)) }
-            persons.append(pid); flat.append(contentsOf: s)
-        }
-        return (persons, flat, dim)
-    }
-
-    func unnamedPrints(after: Int64, limit: Int, dim: Int) throws -> [(id: Int64, print: [Float], rejected: Int64?)] {
-        try db.all("SELECT id, print, rejected_person_id FROM faces WHERE person_id IS NULL AND print IS NOT NULL AND id > ? ORDER BY id LIMIT ?", [after, limit]) { r in
-            (r.int(0), r.blob(1).map { $0.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } } ?? [], r.optInt(2))
-        }.filter { $0.print.count == dim }
-    }
-
-    /// Paging cursor independent of the dim filter (so a batch of wrong-sized prints cannot end the loop early).
-    func lastUnnamedPrintId(after: Int64, limit: Int) throws -> Int64? {
-        try db.scalar("SELECT max(id) FROM (SELECT id FROM faces WHERE person_id IS NULL AND print IS NOT NULL AND id > ? ORDER BY id LIMIT ?)", [after, limit])
-    }
-
-    func storeSuggestions(_ s: [(Int64, Int64?)]) throws {
-        try db.transaction {
-            for (fid, pid) in s { try db.run("UPDATE faces SET suggested_person_id = ? WHERE id = ?", pid, fid) }
-        }
     }
 }

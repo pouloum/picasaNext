@@ -163,6 +163,37 @@ public struct PicasaIni: Sendable {
         }
     }
 
+    // MARK: - Writing (picasa-cli export-ini)
+
+    public init() {}
+
+    /// Sets (or with nil removes) one key, creating the section at the end if needed.
+    public mutating func set(_ section: String, _ key: String, _ value: String?) {
+        if let i = sections.firstIndex(where: { $0.name.caseInsensitiveCompare(section) == .orderedSame }) {
+            sections[i].values[key] = value
+        } else if let value {
+            sections.append((section, [key: value]))
+        }
+    }
+
+    /// Drops sections left without any key.
+    public mutating func removeEmptySections() { sections.removeAll { $0.values.isEmpty } }
+
+    /// Picasa 3.9 layout: `[encoding] utf8=1` first, CRLF line ends, keys sorted for stable diffs.
+    public func serialized() -> String {
+        var out = "[encoding]\r\nutf8=1\r\n"
+        for s in sections where !s.name.isEmpty && s.name.lowercased() != "encoding" && !s.values.isEmpty {
+            out += "[\(s.name)]\r\n"
+            for k in s.values.keys.sorted() { out += "\(k)=\(s.values[k]!)\r\n" }
+        }
+        return out
+    }
+
+    /// Section name Picasa uses for a file: `[` and `]` become `(` and `)`.
+    public static func sectionName(forFile name: String) -> String {
+        name.replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")")
+    }
+
     /// Per-file entries: every section that is not a reserved one.
     public var entries: [PicasaIniEntry] {
         let reserved: Set<String> = ["picasa", "contacts", "contacts2", "encoding"]

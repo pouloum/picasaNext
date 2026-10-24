@@ -11,7 +11,14 @@ public enum PicasaImport {
         if let name, !name.isEmpty {
             try db.run("UPDATE persons SET name = ?, email = coalesce(?, email) WHERE picasa_id = ? AND name = ''", name, email, picasaId)
         }
-        return try db.scalar("SELECT id FROM persons WHERE picasa_id = ?", [picasaId])!
+        return try db.scalar("SELECT coalesce(merged_into, id) FROM persons WHERE picasa_id = ?", [picasaId])!
+    }
+
+    /// Intersection over union of a stored face box and an ini rectangle.
+    static func overlap(_ x: Double, _ y: Double, _ w: Double, _ h: Double, _ r: NormalizedRect) -> Double {
+        let iw = max(0, min(x + w, r.right) - max(x, r.left)), ih = max(0, min(y + h, r.bottom) - max(y, r.top))
+        let inter = iw * ih, union = w * h + r.width * r.height - inter
+        return union > 0 ? inter / union : 0
     }
 
     /// Applies one folder's .picasa.ini. Runs inside the caller's transaction.
@@ -43,9 +50,19 @@ public enum PicasaImport {
             try db.run("UPDATE media SET star = ?, caption = coalesce(?, caption), rotate = ?, filters = ?, hidden = ? WHERE id = ?",
                        e.starred, e.caption, e.rotation, filters, e.hidden, mediaId)
             // Picasa faces are re-imported as a whole; Vision faces and faces the user named (manual) are kept.
-            try db.run("DELETE FROM faces WHERE media_id = ? AND source = ?", mediaId, FaceSource.picasa.rawValue)
+            // …but a Picasa face a human decided on here (ignored, confirmed…) is kept, and matched below.
+            try db.run("DELETE FROM faces WHERE media_id = ? AND source = ? AND human = 0", mediaId, FaceSource.picasa.rawValue)
+            // Faces found by Vision or named here and written back by export-ini come back in the ini:
+            // match them to the existing face (same box) instead of adding a duplicate.
+            let existing = try db.all("SELECT id, x, y, w, h, person_id FROM faces WHERE media_id = ?", [mediaId]) {
+                (id: $0.int(0), x: $0.double(1), y: $0.double(2), w: $0.double(3), h: $0.double(4), person: $0.optInt(5))
+            }
             for f in e.faces {
                 let pid: Int64? = f.isUnnamed ? nil : try personId(picasaId: f.contactId, name: nil, email: nil, db: db)
+                if let same = existing.first(where: { overlap($0.x, $0.y, $0.w, $0.h, f.rect) > 0.5 }) {
+                    if same.person == nil, let pid { try db.run("UPDATE faces SET person_id = ?, suggested_person_id = NULL WHERE id = ?", pid, same.id) }
+                    continue
+                }
                 try db.run("INSERT INTO faces(media_id, x, y, w, h, person_id, source) VALUES(?, ?, ?, ?, ?, ?, ?)",
                            mediaId, f.rect.left, f.rect.top, f.rect.width, f.rect.height, pid, FaceSource.picasa.rawValue)
             }
