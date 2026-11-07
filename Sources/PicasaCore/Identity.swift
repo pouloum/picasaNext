@@ -12,6 +12,11 @@ public enum IdentityKind: String, Sendable, Hashable {
     var col: String { self == .face ? "person_id" : "pet_id" }
     var suggested: String { "suggested_" + col }
     var rejected: String { "rejected_" + col }
+    /// Covering index of the regions (owner, ignored, suggestion, photo, size, rejection): the rows
+    /// themselves hold 3 KB feature prints and must not be read for counts and lists.
+    var identIndex: String { self == .face ? "faces_ident" : "animals_ident" }
+    /// A person drew, tagged or decided on the region (faces from Picasa or drawn by hand included).
+    var humanSQL: String { self == .face ? "(t.human = 1 OR t.source != \(FaceSource.vision.rawValue))" : "t.human = 1" }
 }
 
 extension Library {
@@ -24,6 +29,12 @@ extension Library {
     /// Photos shown in the library (what the grids list): counts and groups use the same set, so a
     /// card's numbers match its lists — hidden copies, ignored and unindexed files are left out.
     static let visibleMedia = "m.ignored = 0 AND m.hidden = 0 AND m.dup_of IS NULL AND m.meta_state = 1 AND m.thumb_state = 1"
+
+    /// Regions joined to their (visible) photos through covering indexes only (v13): SQLite would
+    /// otherwise probe the media rows by id, each one a 4 KB page because of its print.
+    static func regionsOfVisible(_ k: IdentityKind) -> String {
+        "\(k.table) t INDEXED BY \(k.identIndex) JOIN media m INDEXED BY media_visible_id ON m.id = t.media_id"
+    }
 
     /// Regions of photos that are not hidden copies: a copy shares its kept photo's decisions, so the
     /// suggestion engine reads each picture once (no suggestions for copies, no doubled examples).
@@ -40,15 +51,16 @@ extension Library {
     public func owners(_ k: IdentityKind, year: Int? = nil) throws -> [PersonSummary] {
         let (yc, ya) = yearClause(year)
         let t = k.table
+        let regions = Self.regionsOfVisible(k)
         return try db.all("""
             SELECT * FROM (
               SELECT p.id, p.name,
-                (SELECT count(DISTINCT t.media_id) FROM \(t) t JOIN media m ON m.id = t.media_id
+                (SELECT count(DISTINCT t.media_id) FROM \(regions)
                  WHERE t.\(k.col) = p.id AND t.ignored = 0 AND \(Self.visibleMedia)\(yc)) n,
-                (SELECT count(DISTINCT t.media_id) FROM \(t) t JOIN media m ON m.id = t.media_id
-                 WHERE t.\(k.col) IS NULL AND t.\(k.suggested) = p.id AND t.ignored = 0 AND \(Self.visibleMedia)\(yc)) s,
+                (SELECT count(DISTINCT t.media_id) FROM \(regions)
+                 WHERE t.\(k.col) IS NULL AND t.ignored = 0 AND t.\(k.suggested) = p.id AND \(Self.visibleMedia)\(yc)) s,
                 coalesce((SELECT t.id FROM \(t) t WHERE t.id = p.cover_id AND t.\(k.col) = p.id),
-                         (SELECT t.id FROM \(t) t JOIN media m ON m.id = t.media_id WHERE t.\(k.col) = p.id AND \(Self.visibleMedia)\(yc)
+                         (SELECT t.id FROM \(regions) WHERE t.\(k.col) = p.id AND \(Self.visibleMedia)\(yc)
                           ORDER BY coalesce(m.aesthetic, 0) DESC, t.w DESC LIMIT 1))
               FROM \(k.owners) p WHERE p.name != '' AND p.merged_into IS NULL)
             WHERE n > 0 OR s > 0 ORDER BY n DESC
@@ -63,29 +75,43 @@ extension Library {
     public func identityClusters(_ k: IdentityKind, ignored: Bool = false, year: Int? = nil,
                                  threshold: Float = 0.8, maxItems: Int = 5_000) throws -> [FaceCluster] {
         let (yc, ya) = yearClause(year)
-        var items: [(id: Int64, print: [Float]?)] = []
-        try db.query("""
-            SELECT t.id, t.print FROM \(k.table) t JOIN media m ON m.id = t.media_id
+        // Which regions: chosen on the covering indexes (ids only), largest first; then the prints of
+        // just those (reading the prints of every unnamed face to keep 5 000 used to take seconds).
+        let ids = try db.all("""
+            SELECT t.id FROM \(Self.regionsOfVisible(k))
             WHERE t.\(k.col) IS NULL AND t.ignored = ? \(ignored ? "" : "AND t.\(k.suggested) IS NULL") AND \(Self.visibleMedia)\(yc)
-            ORDER BY t.w * t.h DESC LIMIT ?
-            """, [ignored ? 1 : 0] + ya + [maxItems]) { r in
-            items.append((r.int(0), r.blob(1).map { d in d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }))
+            ORDER BY t.w * t.h DESC, t.id LIMIT ?
+            """, [ignored ? 1 : 0] + ya + [maxItems]) { $0.int(0) }
+        guard !ids.isEmpty else { return [] }
+        var prints: [Int64: [Float]] = [:]
+        // One statement text whatever the ids (the prepared-statement cache is keyed by SQL text).
+        let list = "[" + ids.map(String.init).joined(separator: ",") + "]"
+        try db.query("SELECT id, print FROM \(k.table) WHERE id IN (SELECT value FROM json_each(?))", [list]) { r in
+            if let d = r.blob(1) { prints[r.int(0)] = d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } }
         }
+        let items: [(id: Int64, print: [Float]?)] = ids.map { ($0, prints[$0]) }
         guard !items.isEmpty else { return [] }
         let dim = items.compactMap(\.print).first { !$0.isEmpty }?.count ?? 0
-        var leaders: [[Float]] = []
+        // Leaders in one flat row-major matrix: each item is scored against all of them in a single
+        // matrix-vector product (vDSP_mmul) instead of one dot-product call per leader.
+        var leaders: [Float] = []
         var members: [[Int64]] = []
+        var scores: [Float] = []
         var loose: [Int64] = [] // ignored items without a print: one group of their own
         var single: [[Int64]] = [] // unnamed items without a print (not analysed yet): one card each
         for f in items {
             guard let p = f.print, dim > 0, p.count == dim else { if ignored { loose.append(f.id) } else { single.append([f.id]) }; continue }
-            var best = -1, bestScore: Float = threshold
-            for (i, l) in leaders.enumerated() {
-                var s: Float = 0
-                vDSP_dotpr(p, 1, l, 1, &s, vDSP_Length(dim))
-                if s >= bestScore { best = i; bestScore = s }
+            let n = members.count
+            var best = -1
+            if n > 0 {
+                if scores.count < n { scores = [Float](repeating: 0, count: max(n, scores.count * 2)) }
+                vDSP_mmul(leaders, 1, p, 1, &scores, 1, vDSP_Length(n), 1, vDSP_Length(dim))
+                var top: Float = 0
+                var at: vDSP_Length = 0
+                vDSP_maxvi(scores, 1, &top, &at, vDSP_Length(n))
+                if top >= threshold { best = Int(at) }
             }
-            if best >= 0 { members[best].append(f.id) } else { leaders.append(p); members.append([f.id]) }
+            if best >= 0 { members[best].append(f.id) } else { leaders.append(contentsOf: p); members.append([f.id]) }
         }
         if !loose.isEmpty { members.append(loose) }
         // Without a print an item cannot be grouped, but it can still be named: after the groups.
@@ -99,7 +125,7 @@ extension Library {
         return try db.all("""
             SELECT coalesce(sum(t.\(k.col) IS NOT NULL AND t.ignored = 0), 0), coalesce(sum(t.\(k.col) IS NULL AND t.ignored = 0), 0),
                    coalesce(sum(t.ignored), 0)
-            FROM \(k.table) t JOIN media m ON m.id = t.media_id WHERE \(Self.visibleMedia)\(yc)
+            FROM \(Self.regionsOfVisible(k)) WHERE \(Self.visibleMedia)\(yc)
             """, ya) { (Int($0.int(0)), Int($0.int(1)), Int($0.int(2))) }.first ?? (0, 0, 0)
     }
 
@@ -158,11 +184,16 @@ extension Library {
     /// the same person imported from several Picasa contacts. Each group: the one with the most
     /// photos first (the one the others would be merged into).
     public func duplicateOwners(_ k: IdentityKind) throws -> [[PersonSummary]] {
+        Self.duplicateGroups(try owners(k))
+    }
+
+    /// `duplicateOwners` from an already loaded `owners(k)` (all years).
+    public nonisolated static func duplicateGroups(_ owners: [PersonSummary]) -> [[PersonSummary]] {
         func key(_ n: String) -> String {
             n.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
                 .split(whereSeparator: \.isWhitespace).joined(separator: " ")
         }
-        let groups = Dictionary(grouping: try owners(k), by: { key($0.name) }).values.filter { $0.count > 1 }
+        let groups = Dictionary(grouping: owners, by: { key($0.name) }).values.filter { $0.count > 1 }
         return groups.map { $0.sorted { ($0.faces + $0.suggestions, -$0.id) > ($1.faces + $1.suggestions, -$1.id) } }
             .sorted { $0.map(\.faces).reduce(0, +) > $1.map(\.faces).reduce(0, +) }
     }
@@ -346,7 +377,7 @@ extension Library {
     /// One region (face or animal) with its name, for crops and the viewer.
     public func region(_ k: IdentityKind, id: Int64) throws -> FaceRecord? {
         try db.all("""
-            SELECT t.id, t.media_id, t.x, t.y, t.w, t.h, t.\(k.col), t.\(k.suggested), p.name, t.ignored
+            SELECT t.id, t.media_id, t.x, t.y, t.w, t.h, t.\(k.col), t.\(k.suggested), p.name, t.ignored, \(k.humanSQL)
             FROM \(k.table) t LEFT JOIN \(k.owners) p ON p.id = coalesce(t.\(k.col), t.\(k.suggested)) WHERE t.id = ?
             """, [id], Self.region).first
     }
@@ -354,47 +385,62 @@ extension Library {
     /// Every region of a photo (faces or animals), ignored ones included (flagged).
     public func regions(_ k: IdentityKind, mediaId: Int64) throws -> [FaceRecord] {
         try db.all("""
-            SELECT t.id, t.media_id, t.x, t.y, t.w, t.h, t.\(k.col), t.\(k.suggested), p.name, t.ignored
+            SELECT t.id, t.media_id, t.x, t.y, t.w, t.h, t.\(k.col), t.\(k.suggested), p.name, t.ignored, \(k.humanSQL)
             FROM \(k.table) t LEFT JOIN \(k.owners) p ON p.id = coalesce(t.\(k.col), t.\(k.suggested)) WHERE t.media_id = ?
             """, [mediaId], Self.region)
     }
 
     static func region(_ r: Database.Row) -> FaceRecord {
         FaceRecord(id: r.int(0), mediaId: r.int(1), x: r.double(2), y: r.double(3), w: r.double(4), h: r.double(5),
-                   personId: r.optInt(6), suggestedPersonId: r.optInt(7), personName: r.optText(8), ignored: r.int(9) != 0)
+                   personId: r.optInt(6), suggestedPersonId: r.optInt(7), personName: r.optText(8), ignored: r.int(9) != 0,
+                   human: r.int(10) != 0)
     }
 
     /// Changes when items are added, removed, named, suggested or ignored.
     public func identityToken(_ k: IdentityKind) throws -> [Int64] {
-        try db.all("""
-            SELECT count(*), coalesce(max(id), 0), count(\(k.col)), count(\(k.suggested)), count(\(k.rejected)), sum(ignored), count(print)
-            FROM \(k.table)
-            """) { [$0.int(0), $0.int(1), $0.int(2), $0.int(3), $0.int(4), $0.int(5), $0.int(6)] }.first ?? []
+        // Read on the covering index (not the rows and their prints). Face prints arrive with the face
+        // analysis of a photo (face_state 0 → 1, tiny partial index); animal prints are made later
+        // (petPrints), on a small table, so they are counted directly.
+        var token = try db.all("""
+            SELECT count(*), coalesce(max(id), 0), count(\(k.col)), count(\(k.suggested)), count(\(k.rejected)), coalesce(sum(ignored), 0)
+            FROM \(k.table) INDEXED BY \(k.identIndex)
+            """) { [$0.int(0), $0.int(1), $0.int(2), $0.int(3), $0.int(4), $0.int(5)] }.first ?? []
+        token.append(k == .face
+            ? try db.scalar("SELECT count(*) FROM media WHERE face_state = 0") ?? 0
+            : try db.scalar("SELECT count(print) FROM animals") ?? 0)
+        return token
     }
 
     // MARK: - Suggestion engine data
 
-    /// Normalized mean print per named person / pet.
-    func centroids(_ k: IdentityKind) throws -> (persons: [Int64], centroids: [Float], dim: Int) {
-        var sums: [Int64: [Float]] = [:]
+    /// Prints of the named faces / animals, grouped by person / pet: person `i` owns rows
+    /// `starts[i] ..< starts[i + 1]` of `examples` (flat, `dim` floats per row). At most `cap` per
+    /// person, evenly spread over its faces (by id, roughly by date): the few people named on
+    /// thousands of faces would otherwise make most of the work for little gain.
+    func namedExamples(_ k: IdentityKind, cap: Int = 1000) throws -> (persons: [Int64], examples: [Float], starts: [Int], dim: Int) {
+        var persons: [Int64] = [], examples: [Float] = [], starts: [Int] = []
         var dim = 0
-        try db.query("SELECT \(k.col), print FROM \(k.table) WHERE \(k.col) IS NOT NULL AND print IS NOT NULL AND \(Self.notCopy)") { r in
+        var current: [[Float]] = []
+        func flush() {
+            guard !current.isEmpty else { return }
+            starts.append(examples.count / dim)
+            let n = current.count, keep = min(n, cap)
+            for j in 0..<keep { examples.append(contentsOf: current[keep == 1 ? 0 : j * (n - 1) / (keep - 1)]) }
+            current.removeAll(keepingCapacity: true)
+        }
+        try db.query("SELECT \(k.col), print FROM \(k.table) WHERE \(k.col) IS NOT NULL AND print IS NOT NULL AND \(Self.notCopy) ORDER BY \(k.col), id") { r in
             guard let d = r.blob(1) else { return }
             let v = d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
             guard !v.isEmpty else { return } // animal crop that gave no print
             if dim == 0 { dim = v.count }
             guard v.count == dim else { return }
             let pid = r.int(0)
-            if var s = sums[pid] { vDSP_vadd(s, 1, v, 1, &s, 1, vDSP_Length(dim)); sums[pid] = s } else { sums[pid] = v }
+            if persons.last != pid { flush(); persons.append(pid) }
+            current.append(v)
         }
-        var persons: [Int64] = [], flat: [Float] = []
-        for (pid, var s) in sums {
-            var n: Float = 0
-            vDSP_svesq(s, 1, &n, vDSP_Length(dim)); n = sqrt(n)
-            if n > 0 { vDSP_vsdiv(s, 1, &n, &s, 1, vDSP_Length(dim)) }
-            persons.append(pid); flat.append(contentsOf: s)
-        }
-        return (persons, flat, dim)
+        flush()
+        starts.append(dim > 0 ? examples.count / dim : 0)
+        return (persons, examples, starts, dim)
     }
 
     /// Faces / animals a human said are not someone (rejected suggestion, or taken away), with their print.

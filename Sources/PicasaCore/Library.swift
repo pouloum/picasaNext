@@ -9,7 +9,7 @@ public actor Library {
     let db: Database
     public nonisolated let thumbs: ThumbnailStore
 
-    public static let schemaVersion: Int64 = 12
+    public static let schemaVersion: Int64 = 14
 
     /// Default location. Deliberately not named like the source folder, so deleting one is never
     /// mistaken for deleting the other.
@@ -41,6 +41,8 @@ public actor Library {
         if v < 10 { try migrateV10(db) }
         if v < 11 { try migrateV11(db) }
         if v < 12 { try migrateV12(db) }
+        if v < 13 { try migrateV13(db) }
+        if v < 14 { try migrateV14(db) }
         try db.exec("PRAGMA user_version = \(schemaVersion)")
     }
 
@@ -197,10 +199,44 @@ public actor Library {
         }
     }
 
+    /// v13: rows of media and faces / animals carry 3 KB feature prints, so any query that reads the
+    /// rows themselves drags hundreds of MB through the disk. Covering indexes for what the startup,
+    /// People / Animals and Labels read (measured on 207k photos, cold: grid 15 s → 0.05 s, rotations
+    /// 12 s → 0 s, identity counts 12 s → 0.04 s, clustering selection 6 s → 0.03 s):
+    /// - media_folder_visible gains dup_of (the grid query ended up reading every row for it);
+    /// - media_rotated: the few rotated photos, loaded before the first grid;
+    /// - media_visible_id: visibility, date and aesthetics by id, for joins from faces / animals / labels;
+    /// - faces_ident / animals_ident: owner, ignored, suggestion, photo, size and rejection of each region.
+    /// label_info: one row per label / keyword (count, cover), rebuilt when the triggers mark it stale.
+    static func migrateV13(_ db: Database) throws {
+        try db.transaction {
+            try db.exec("""
+            DROP INDEX IF EXISTS media_folder_visible;
+            CREATE INDEX media_folder_visible ON media(folder_id, meta_state, thumb_state, ignored, hidden, dup_of, taken_at);
+            CREATE INDEX IF NOT EXISTS media_rotated ON media(rotate) WHERE rotate % 4 != 0;
+            CREATE INDEX IF NOT EXISTS media_visible_id ON media(id, ignored, hidden, dup_of, meta_state, thumb_state, taken_at, aesthetic);
+            CREATE INDEX IF NOT EXISTS faces_ident ON faces(person_id, ignored, suggested_person_id, media_id, w, h, rejected_person_id);
+            CREATE INDEX IF NOT EXISTS animals_ident ON animals(pet_id, ignored, suggested_pet_id, media_id, w, h, rejected_pet_id);
+            """)
+            try createLabelInfo(db)
+            try db.exec("ANALYZE")
+        }
+    }
+
+    /// v14: media_root_stats, what the Folders cards count per root (kind, size and every *_state by
+    /// folder), so `rootStats()` is one pass over an index instead of the media rows and their prints.
+    static func migrateV14(_ db: Database) throws {
+        try db.exec("""
+        CREATE INDEX IF NOT EXISTS media_root_stats ON media(folder_id, kind, size, meta_state, thumb_state,
+            analysis_state, face_state, ignored, dup_of);
+        ANALYZE;
+        """)
+    }
+
     /// Whether the groups (duplicates, bursts, similar) have to be built (new library, or upgraded).
     public func groupsNeedRebuild() throws -> Bool {
-        let groups = try db.scalar("SELECT count(*) FROM group_info") ?? 0
-        let prints = try db.scalar("SELECT count(*) FROM media WHERE quick_hash IS NOT NULL LIMIT 1") ?? 0
+        let groups = try db.scalar("SELECT EXISTS(SELECT 1 FROM group_info)") ?? 0
+        let prints = try db.scalar("SELECT EXISTS(SELECT 1 FROM media WHERE quick_hash IS NOT NULL)") ?? 0
         return groups == 0 && prints > 0
     }
 
@@ -327,6 +363,55 @@ public actor Library {
         try db.all("SELECT id, path FROM roots ORDER BY path") { ($0.int(0), $0.text(1)) }
     }
 
+    /// What a root folder (added with `scan`) holds, for the Folders cards.
+    public struct RootStats: Sendable, Equatable, Identifiable {
+        public var id: Int64
+        public var path: String
+        public var folders = 0
+        /// Photos (images and raws) and videos, hidden copies of identical files and ignored small images excepted.
+        public var photos = 0, videos = 0
+        public var bytes: Int64 = 0
+        /// Identical files hidden as copies, and small images ignored (thumbnails written by other apps).
+        public var copies = 0, ignored = 0
+        /// Work left, as counted by `stats()`: metadata, thumbnails, whole-image analysis, faces.
+        public var pendingMeta = 0, pendingThumbs = 0, pendingAnalysis = 0, pendingFaces = 0
+        public var lastScan: Date?
+        public var pending: Int { pendingMeta + pendingThumbs + pendingAnalysis + pendingFaces }
+        public init(id: Int64, path: String) { self.id = id; self.path = path }
+    }
+
+    /// One row per root, in one statement: the folders table is small; media is read through the
+    /// covering index media_root_stats only (its rows hold 3 KB prints, see docs/PERF.md).
+    public func rootStats() throws -> [RootStats] {
+        try db.all("""
+            SELECT r.id, r.path, coalesce(fa.n, 0), fa.scanned,
+              coalesce(ma.photos, 0), coalesce(ma.videos, 0), coalesce(ma.bytes, 0), coalesce(ma.copies, 0), coalesce(ma.ignored, 0),
+              coalesce(ma.meta, 0), coalesce(ma.thumbs, 0), coalesce(ma.analysis, 0), coalesce(ma.faces, 0)
+            FROM roots r
+            LEFT JOIN (SELECT root_id, count(*) n, max(nullif(scanned_at, 0)) scanned FROM folders GROUP BY root_id) fa ON fa.root_id = r.id
+            LEFT JOIN (
+              SELECT f.root_id,
+                sum(m.kind != 1 AND m.ignored = 0 AND m.dup_of IS NULL) photos,
+                sum(m.kind = 1 AND m.ignored = 0 AND m.dup_of IS NULL) videos,
+                sum(m.size) bytes, sum(m.dup_of IS NOT NULL) copies, sum(m.ignored = 1) ignored,
+                sum(m.meta_state = 0) meta, sum(m.thumb_state = 0 AND m.ignored = 0) thumbs,
+                sum(m.analysis_state = 0 AND m.ignored = 0) analysis, sum(m.face_state = 0 AND m.ignored = 0) faces
+              FROM media m INDEXED BY media_root_stats JOIN folders f ON f.id = m.folder_id
+              GROUP BY f.root_id
+            ) ma ON ma.root_id = r.id
+            ORDER BY r.path
+            """) { r in
+            var s = RootStats(id: r.int(0), path: r.text(1))
+            s.folders = Int(r.int(2))
+            s.lastScan = r.optDouble(3).map { Date(timeIntervalSince1970: $0) }
+            s.photos = Int(r.int(4)); s.videos = Int(r.int(5)); s.bytes = r.int(6)
+            s.copies = Int(r.int(7)); s.ignored = Int(r.int(8))
+            s.pendingMeta = Int(r.int(9)); s.pendingThumbs = Int(r.int(10))
+            s.pendingAnalysis = Int(r.int(11)); s.pendingFaces = Int(r.int(12))
+            return s
+        }
+    }
+
     /// Run arbitrary work against the database inside the actor.
     public func withDB<T: Sendable>(_ body: @Sendable (Database) throws -> T) rethrows -> T { try body(db) }
 
@@ -394,17 +479,19 @@ public actor Library {
         }
         s.lastScan = try db.all("SELECT max(scanned_at) FROM folders WHERE scanned_at > 0") { $0.optDouble(0) }.first?.map { Date(timeIntervalSince1970: $0) }
         s.faces = Int(try db.scalar("SELECT count(*) FROM faces") ?? 0)
-        s.namedFaces = Int(try db.scalar("SELECT count(*) FROM faces WHERE person_id IS NOT NULL") ?? 0)
+        // One pass over the covering index faces_ident (the rows hold 3 KB prints).
+        try db.query("""
+            SELECT count(person_id), coalesce(sum(person_id IS NULL AND ignored = 0), 0), coalesce(sum(ignored = 1), 0)
+            FROM faces INDEXED BY faces_ident
+            """) { r in s.namedFaces = Int(r.int(0)); s.unnamedFaces = Int(r.int(1)); s.ignoredFaces = Int(r.int(2)) }
         s.persons = Int(try db.scalar("SELECT count(*) FROM persons WHERE merged_into IS NULL") ?? 0)
         s.albums = Int(try db.scalar("SELECT count(*) FROM albums") ?? 0)
         s.bursts = Int(try db.scalar("SELECT count(*) FROM group_info WHERE kind = 1") ?? 0)
         s.duplicateGroups = Int(try db.scalar("SELECT count(*) FROM group_info WHERE kind = 0") ?? 0)
         s.burstPhotos = Int(try db.scalar("SELECT count(*) FROM bursts") ?? 0)
-        s.labelled = Int(try db.scalar("SELECT count(DISTINCT media_id) FROM labels") ?? 0)
+        s.labelled = try labelledPhotos()
         s.animals = Int(try db.scalar("SELECT count(DISTINCT media_id) FROM animals") ?? 0)
         s.pets = Int(try db.scalar("SELECT count(*) FROM pets WHERE merged_into IS NULL") ?? 0)
-        s.unnamedFaces = Int(try db.scalar("SELECT count(*) FROM faces WHERE person_id IS NULL AND ignored = 0") ?? 0)
-        s.ignoredFaces = Int(try db.scalar("SELECT count(*) FROM faces WHERE ignored = 1") ?? 0)
         s.similarGroups = Int(try db.scalar("SELECT count(*) FROM group_info WHERE kind = 2") ?? 0)
         s.similarPhotos = Int(try db.scalar("SELECT count(*) FROM similar") ?? 0)
         return s

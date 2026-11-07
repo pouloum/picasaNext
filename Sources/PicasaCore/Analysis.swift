@@ -17,9 +17,19 @@ public struct Analyzer: Sendable {
     /// Labels kept: those Vision can report at 90 % precision (Apple's recommended filter).
     public var labelPrecision: Float = 0.9
 
+    /// Adaptive mode (see Throughput.swift); nil: the fixed `concurrency` and `batch`.
+    public var profile: ThroughputProfile?
+    /// Called once per volume with the plan chosen for it.
+    public var onPlan: (@Sendable (String) -> Void)?
+
     public init(library: Library, concurrency: Int = 4) {
         self.library = library
         self.concurrency = max(1, concurrency)
+    }
+
+    public init(library: Library, profile: ThroughputProfile) {
+        self.init(library: library)
+        self.profile = profile
     }
 
     struct Work: Sendable {
@@ -43,17 +53,22 @@ public struct Analyzer: Sendable {
         try await library.retryUnreadableAnalysis()
         var done = 0
         let (px, precision) = (analysisPixels, labelPrecision)
+        let tuning = profile.map { ThroughputSession(library: library, stage: .analysis, profile: $0) }
+        tuning?.onPlan = onPlan
         while true {
-            let work = try await library.pendingAnalysis(limit: batch)
-            if work.isEmpty { break }
-            let results = await parallelMap(work, concurrency: concurrency) { w in
+            let pending = try await library.pendingAnalysis(limit: tuning?.batch ?? batch)
+            if pending.isEmpty { break }
+            let (c, work) = if let tuning { await tuning.begin(pending) { $0.url.path } } else { (concurrency, pending) }
+            let results = await parallelMap(work, concurrency: c) { w in
                 (w, await Self.analyse(w, maxPixel: px, labelPrecision: precision))
             }
             try VolumeUnavailable.check(results.filter { $0.1 == nil }.map(\.0.url))
             try await library.storeAnalysis(results)
+            tuning?.end(items: results.count)
             done += results.count
             progress?(LibraryProgress(stage: "analysis", done: done, total: nil, current: work.last?.url.path))
         }
+        await tuning?.save()
         return done
     }
 

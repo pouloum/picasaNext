@@ -148,6 +148,12 @@ do {
     check(lib.thumbs.exists(id: ids[0]), "thumbnail written")
     let recent = try await lib.mediaIds(.recent)
     check(recent == ids, "indexed items listed in Last indexed: \(recent)")
+    let recentFaces = try await lib.mediaIdsAndYears(.recent, recent: .faces).map(\.id)
+    check(recentFaces == ids, "Last indexed ▸ Faces lists the photo with the Picasa face: \(recentFaces)")
+    let recentAnimals = try await lib.mediaIdsAndYears(.recent, recent: .animals), recentLabels = try await lib.mediaIdsAndYears(.recent, recent: .labels)
+    check(recentAnimals.isEmpty && recentLabels.isEmpty, "Last indexed ▸ Animals / Labels empty before any analysis")
+    let picasaFace = try await lib.faces(mediaId: ids[0])
+    check(picasaFace.count == 1 && picasaFace[0].human, "a Picasa face counts as made by a person: \(picasaFace)")
     _ = try await lib.withDB { db in try db.run("UPDATE media SET lat = 48.85, lon = 2.35 WHERE id = ?", ids[0]) }
     let geo = try await lib.geoPoints()
     check(geo.map(\.id) == [ids[0]], "geotagged photos listed for the map: \(geo)")
@@ -532,6 +538,25 @@ do {
     let trip = summaries.first { $0.label == "trip" }
     check(trip?.count == 2 && trip?.coverMediaId == synth[0], "label card: count and best-looking cover (\(String(describing: trip)))")
     check(summaries.first { $0.label == "musical_instrument" }?.title == "Musical instrument", "label display name")
+    // label_info: precomputed, marked stale by triggers (labels, keywords, photo visibility).
+    let fresh = try await lib.labelInfoStale()
+    check(!fresh, "label_info fresh after labelSummaries")
+    try await lib.withDB { db in try db.run("INSERT INTO tags(media_id, tag) VALUES(?, 'trip')", synth[2]) }
+    let stale = try await lib.labelInfoStale()
+    check(stale, "a new keyword marks label_info stale")
+    let cachedTrip = try await lib.cachedLabelSummaries().first { $0.label == "trip" }?.count
+    check(cachedTrip == 2, "cached cards stay until rebuilt")
+    let rebuiltTrip = try await lib.labelSummaries().first { $0.label == "trip" }?.count
+    check(rebuiltTrip == 3, "rebuilt with the new keyword: \(String(describing: rebuiltTrip))")
+    try await lib.withDB { db in try db.run("UPDATE media SET hidden = 1 WHERE id = ?", synth[2]) }
+    let hiddenTrip = try await lib.labelSummaries().first { $0.label == "trip" }?.count
+    check(hiddenTrip == 2, "hiding a photo updates its labels' counts")
+    try await lib.withDB { db in
+        try db.run("UPDATE media SET hidden = 0 WHERE id = ?", synth[2])
+        try db.run("DELETE FROM tags WHERE media_id = ? AND tag = 'trip'", synth[2])
+    }
+    let removedTrip = try await lib.labelSummaries().first { $0.label == "trip" }?.count
+    check(removedTrip == 2, "removing a keyword updates the card")
     let sugg = try await lib.suggestions(for: "musical inst")
     check(sugg.contains(.label("musical_instrument")), "suggestions match labels with spaces: \(sugg)")
     let janeSugg = try await lib.suggestions(for: "jan")
@@ -611,6 +636,25 @@ do {
     let t1 = try await lib.similarThreshold()
     let rt = try await lib.groupSimilar()
     check(t0 == 0.97 && t1 == 0.93 && rt.threshold == 0.93, "similarity threshold persisted (\(t0) → \(t1), used \(rt.threshold))")
+
+    // Pipeline settings shared by picasa-cli and the app's Settings window.
+    let s0 = try await lib.indexSizes()
+    try await lib.setIndexSizes(minSize: 0, thumbSize: 300)
+    var ix = Indexer(library: lib)
+    try await ix.useSavedSizes()
+    check(s0 == (200, 512) && ix.minSize == 0 && ix.thumbSize == 300, "index sizes saved and applied (\(s0) → \(ix.minSize), \(ix.thumbSize))")
+    try await lib.setIndexSizes(minSize: Library.defaultMinSize, thumbSize: Library.defaultThumbSize)
+    let g0 = try await lib.geocodeLimit()
+    try await lib.setGeocodeLimit(250)
+    let g1 = try await lib.geocodeLimit()
+    try await lib.setGeocodeLimit(nil)
+    let g2 = try await lib.geocodeLimit()
+    check(g0 == nil && g1 == 250 && g2 == nil, "geocode limit saved (\(String(describing: g0)), \(String(describing: g1)), \(String(describing: g2)))")
+    check(Library.excludePattern(" Backups ") == "Backups" && Library.excludePattern("/a/b/../c/") == "/a/c", "exclude patterns normalized")
+    check(Pipeline.ExportFormat(argument: "ini") == .picasa && Pipeline.ExportFormat(argument: "xmp") == .xmp && Pipeline.ExportFormat(argument: "x") == nil,
+          "export format arguments")
+    let dryAll = try await Pipeline.export(lib, format: .all, dryRun: true)
+    check(dryAll.ini?.dryRun == true && dryAll.xmp?.dryRun == true && dryAll.ini?.written == 0 && dryAll.xmp?.written == 0, "export dry run writes nothing: \(dryAll)")
 
     // Accented name stored NFD on disk, NFC in .picasa.ini.
     let nfd = "e\u{301}te\u{301}.jpg"
@@ -726,6 +770,193 @@ do {
     let dt = Date().timeIntervalSince(t0)
     check(c.count == 1 && c[0].count == 60_000 && dt < 1, "clustering 60k photos in one cell: \(String(format: "%.2f", dt)) s")
 }
+
+// Per-root counts for the Folders cards (rootStats), through the covering index only.
+do {
+    let dir = tmp.appendingPathComponent("pn-roots-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let lib = try Library(root: dir)
+    try await lib.withDB { db in
+        let a = try db.run("INSERT INTO roots(path, added_at) VALUES('/Photos/A', 0)")
+        let b = try db.run("INSERT INTO roots(path, added_at) VALUES('/Volumes/NAS/B', 0)")
+        _ = try db.run("INSERT INTO roots(path, added_at) VALUES('/Volumes/Empty', 0)")
+        let a1 = try db.run("INSERT INTO folders(root_id, path, scanned_at) VALUES(?, '/Photos/A', 100)", a)
+        let a2 = try db.run("INSERT INTO folders(root_id, path, scanned_at) VALUES(?, '/Photos/A/2020', 250)", a)
+        let b1 = try db.run("INSERT INTO folders(root_id, path, scanned_at) VALUES(?, '/Volumes/NAS/B', 0)", b)
+        // name, folder, kind, size, meta, thumb, analysis, face, ignored, dup_of
+        let rows: [(String, Int64, Int, Int, Int, Int, Int, Int, Int)] = [
+            ("p1.jpg", a1, 0, 10, 1, 1, 1, 1, 0), // photo, done
+            ("p2.cr2", a2, 2, 20, 1, 1, 0, 0, 0), // raw counts as a photo; analysis + faces to do
+            ("v1.mov", a2, 1, 30, 1, 0, 3, 3, 0), // video, thumbnail to do
+            ("t.jpg", a2, 0, 1, 1, 0, 0, 0, 1),   // ignored small image: only its metadata counts
+            ("n1.jpg", b1, 0, 5, 0, 0, 0, 0, 0),  // not indexed yet
+        ]
+        var first: Int64 = 0
+        for r in rows {
+            let id = try db.run("""
+                INSERT INTO media(folder_id, name, kind, size, mtime, meta_state, thumb_state, analysis_state, face_state, ignored)
+                VALUES(?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                """, r.1, r.0, r.2, r.3, r.4, r.5, r.6, r.7, r.8)
+            if first == 0 { first = id }
+        }
+        // A hidden copy of p1 (identical file): not counted as a photo.
+        _ = try db.run("INSERT INTO media(folder_id, name, kind, size, mtime, meta_state, thumb_state, analysis_state, face_state, dup_of) VALUES(?, 'p1 copy.jpg', 0, 10, 0, 1, 1, 1, 1, ?)", a2, first)
+    }
+    let s = try await lib.rootStats()
+    check(s.map(\.path) == ["/Photos/A", "/Volumes/Empty", "/Volumes/NAS/B"], "one card per root, by path: \(s.map(\.path))")
+    let a = s[0], empty = s[1], b = s[2]
+    check(a.folders == 2 && a.photos == 2 && a.videos == 1 && a.copies == 1 && a.ignored == 1 && a.bytes == 71,
+          "root A counts (copy and ignored excepted): \(a)")
+    check(a.pendingMeta == 0 && a.pendingThumbs == 1 && a.pendingAnalysis == 1 && a.pendingFaces == 1, "root A work left: \(a)")
+    check(a.lastScan == Date(timeIntervalSince1970: 250), "last scan of A is its latest folder: \(String(describing: a.lastScan))")
+    check(b.photos == 1 && b.pendingMeta == 1 && b.pendingThumbs == 1 && b.lastScan == nil, "root B never fully scanned: \(b)")
+    check(empty.folders == 0 && empty.photos == 0 && empty.pending == 0 && empty.lastScan == nil, "empty root: \(empty)")
+    let plan = try await lib.withDB { db in
+        try db.all("EXPLAIN QUERY PLAN SELECT f.root_id, sum(m.size), sum(m.face_state = 0) FROM media m INDEXED BY media_root_stats JOIN folders f ON f.id = m.folder_id GROUP BY f.root_id") { $0.text(3) }
+    }
+    check(plan.contains { $0.contains("COVERING INDEX media_root_stats") }, "media read through the covering index: \(plan)")
+} catch { check(false, "root stats threw \(error)") }
+
+// Throughput plans and tuning.
+do {
+    let host = HostInfo(performanceCores: 8, efficiencyCores: 4, memoryGB: 32)
+    let ssd = ThroughputPlan.make(profile: .auto, volume: .internalSSD, stage: .thumbnails, host: host)
+    check(ssd.concurrency == 8 && ssd.maxConcurrency == 12 && ssd.adaptive && !ssd.sortByPath, "internal SSD plan \(ssd)")
+    let hdd = ThroughputPlan.make(profile: .auto, volume: .hdd, stage: .metadata, host: host)
+    check(hdd.concurrency == 2 && hdd.maxConcurrency == 2 && hdd.sortByPath, "hard disk plan \(hdd)")
+    let nasAnalysis = ThroughputPlan.make(profile: .auto, volume: .internalSSD, stage: .analysis, host: host)
+    check(nasAnalysis.concurrency == 4 && nasAnalysis.maxConcurrency == 8, "analysis capped by performance cores \(nasAnalysis)")
+    let forced = ThroughputPlan.make(profile: .nas, volume: .internalSSD, stage: .metadata, host: host)
+    check(forced.concurrency == 4 && forced.maxConcurrency == 8, "nas profile forces network values \(forced)")
+    let eco = ThroughputPlan.make(profile: .eco, volume: .internalSSD, stage: .analysis, host: host)
+    check(eco.concurrency == 1 && !eco.adaptive, "eco plan \(eco)")
+    let small = ThroughputPlan.make(profile: .auto, volume: .internalSSD, stage: .analysis, host: HostInfo(performanceCores: 4, efficiencyCores: 0, memoryGB: 0.5))
+    check(small.maxConcurrency == 1 && small.concurrency == 1, "analysis capped by memory \(small)")
+
+    // Throughput grows with concurrency up to 6, flat after: the tuner climbs, then stays around 6.
+    var t = AdaptiveTuner(plan: ThroughputPlan(concurrency: 2, minConcurrency: 1, maxConcurrency: 12, batch: 8, adaptive: true, sortByPath: false))
+    for _ in 0..<60 {
+        let rate = Double(min(t.concurrency, 6)) * 2 // photos/s
+        t.record(items: t.batch, seconds: Double(t.batch) / rate)
+    }
+    check((5...7).contains(t.concurrency), "tuner settles near the knee: \(t.concurrency)")
+    check((14...22).contains(t.batch), "batch aims at ~1.5 s: \(t.batch) at \(min(t.concurrency, 6) * 2)/s")
+    let resumed = AdaptiveTuner(plan: ssd, saved: (concurrency: 40, batch: 500))
+    check(resumed.concurrency == ssd.maxConcurrency && resumed.batch == AdaptiveTuner.maxBatch, "saved values clamped to the plan")
+}
+
+// MARK: auto-scan (targeted scan, folder watcher, catch-up after a restart)
+/// Waits for the first watcher batch matching `pred` (nil after `timeout` seconds).
+func nextBatch(_ w: (@escaping @Sendable (FolderWatcher.Batch) -> Void) -> FolderWatcher, timeout: Double = 15,
+               where pred: @escaping @Sendable (FolderWatcher.Batch) -> Bool) async -> (FolderWatcher, FolderWatcher.Batch?) {
+    final class Box: @unchecked Sendable { var batch: FolderWatcher.Batch?; let lock = NSLock() }
+    let box = Box()
+    let watcher = w { b in box.lock.withLock { if box.batch == nil, pred(b) { box.batch = b } } }
+    check(watcher.start(), "watcher starts")
+    let end = Date().addingTimeInterval(timeout)
+    while Date() < end, box.lock.withLock({ box.batch == nil }) { try? await Task.sleep(for: .milliseconds(100)) }
+    return (watcher, box.lock.withLock { box.batch })
+}
+do {
+    let fm = FileManager.default
+    let root = tmp.appendingPathComponent("watched")
+    func touch(_ rel: String) throws {
+        let u = root.appendingPathComponent(rel)
+        try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: u)
+    }
+    try touch("a/x.jpg"); try touch("d/old.jpg"); try touch("d/sub/old2.jpg"); try touch(".hidden/h.jpg")
+    let lib = try Library(root: tmp.appendingPathComponent("lib-watch"))
+    let scanner = Scanner(library: lib)
+    let full = try await scanner.scan(root: root)
+    check(full.added == 3, "watched root: full scan \(full)")
+    let a = root.appendingPathComponent("a").path
+
+    // Created, renamed, a new folder of folders, a deleted folder (reported through its parent).
+    try touch("a/y.jpg"); try touch("a/b/c/z.jpg")
+    try fm.moveItem(at: root.appendingPathComponent("a/x.jpg"), to: root.appendingPathComponent("a/x2.jpg"))
+    try fm.removeItem(at: root.appendingPathComponent("d"))
+    let r1 = try await scanner.scan(folders: [a, root.path])
+    check(r1.added == 3 && r1.removed == 3, "targeted scan: +y +x2 +z, −x −old −old2: \(r1)")
+    let names = try await lib.withDB { db in try db.all("SELECT name FROM media ORDER BY name") { $0.text(0) } }
+    check(names == ["x2.jpg", "y.jpg", "z.jpg"], "library after the targeted scan: \(names)")
+    let r2 = try await scanner.scan(folders: [a])
+    check(r2.added == 0 && r2.removed == 0 && r2.updated == 0, "targeted rescan is a no-op: \(r2)")
+    let hidden = try await scanner.scan(folders: [root.appendingPathComponent(".hidden").path])
+    check(hidden.folders == 0 && hidden.added == 0, "hidden folders stay skipped: \(hidden)")
+    let outside = try await scanner.scan(folders: [tmp.appendingPathComponent("elsewhere").path])
+    check(outside.folders == 0, "folders outside the roots are ignored")
+    // Gone folder reported directly (no parent event).
+    try fm.removeItem(at: root.appendingPathComponent("a/b"))
+    let r3 = try await scanner.scan(folders: [root.appendingPathComponent("a/b/c").path])
+    check(r3.removed == 1, "a deleted folder reported itself is pruned: \(r3)")
+    let r3b = try await scanner.scan(folders: [a])
+    check(r3b.removed == 0, "…and its parent no longer lists it: \(r3b)")
+
+    // FSEvents needs fseventsd: unreachable from some sandboxes, where these checks are skipped.
+    let fsevents = FolderWatcher.currentEventId() > 0 && FolderWatcher.journalUUID(for: root.path) != nil
+    if fsevents {
+        // Live watcher: a copied photo is reported once the folder is quiet.
+        let (w2, live2) = await nextBatch({ handler in
+            let w = FolderWatcher(roots: [root.path], sinceWhen: FolderWatcher.currentEventId(), latency: 0.2, quiet: 0.5, handler: handler)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1) { try? touch("a/live.jpg") }
+            return w
+        // A batch still carrying the changes made just before (renames, deletions) can come first.
+        }, where: { $0.folders.contains(a) && FileManager.default.fileExists(atPath: a + "/live.jpg") })
+        check(live2 != nil, "live watcher reports the changed folder: \(String(describing: live2))")
+        w2.stop()
+        let r4 = try await scanner.scan(folders: live2?.folders ?? [])
+        check(r4.added == 1, "the watcher's folders bring the new photo in: \(r4)")
+
+        // Restart: the checkpoint is saved, files arrive while "the app is closed", then the journal is replayed.
+        let uuid = FolderWatcher.journalUUID(for: root.path)
+        check(uuid != nil, "the temporary volume has an FSEvents journal")
+        try await lib.saveWatchCheckpoint(eventId: FolderWatcher.currentEventId(), volumes: [root.path: uuid ?? "?"])
+        try await Task.sleep(for: .milliseconds(300))
+        try touch("a/while-closed.jpg"); try touch("new/n.jpg")
+        try await Task.sleep(for: .seconds(1)) // let fseventsd record them
+        let plan = try await lib.watchPlan(catchUp: true)
+        check(plan.watched == [root.path] && plan.fullRescan.isEmpty && plan.sinceWhen != nil, "restart replays the journal: \(plan)")
+        let (w3, replay) = await nextBatch({ FolderWatcher(roots: plan.watched, sinceWhen: plan.sinceWhen, latency: 0.2, quiet: 0.5, handler: $0) },
+                                           where: { $0.historyDone })
+        w3.stop()
+        check(replay?.folders.contains(a) == true || replay?.recursive.isEmpty == false, "replay reports what changed while closed: \(String(describing: replay))")
+        let r5 = try await scanner.scan(folders: replay?.folders ?? [], recursive: replay?.recursive ?? [])
+        check(r5.added == 2, "catch-up brings both photos in: \(r5)")
+
+        // Fallbacks to a full rescan.
+        try await lib.saveWatchCheckpoint(eventId: FolderWatcher.currentEventId(), volumes: [root.path: "another-volume"])
+        let other = try await lib.watchPlan(catchUp: true)
+        check(other.fullRescan == [root.path], "another journal → full rescan")
+        try await lib.saveWatchCheckpoint(eventId: FolderWatcher.currentEventId() + 1_000_000, volumes: [root.path: uuid ?? "?"])
+        let future = try await lib.watchPlan(catchUp: true)
+        check(future.fullRescan == [root.path] && future.sinceWhen == nil, "invalid event ID → full rescan")
+        let noCatchUp = try await lib.watchPlan(catchUp: false)
+        check(noCatchUp.fullRescan.isEmpty, "no catch-up asked → no rescan")
+    } else {
+        print("SKIP auto-scan FSEvents checks: fseventsd not reachable here (event ID \(FolderWatcher.currentEventId()))")
+        let plan = try await lib.watchPlan(catchUp: true)
+        check(plan.watched.isEmpty && plan.fullRescan == [root.path] && plan.periodic == [root.path],
+              "no journal → full rescan at launch, then periodic: \(plan)")
+    }
+    let fresh = try Library(root: tmp.appendingPathComponent("lib-watch2"))
+    _ = try await Scanner(library: fresh).scan(root: root)
+    let first = try await fresh.watchPlan(catchUp: true)
+    check(first.fullRescan == [root.path], "first launch → full rescan")
+    let onByDefault = try await fresh.watchEnabled()
+    check(onByDefault, "watching is on by default")
+    try await fresh.setWatchEnabled(false)
+    let off = try await fresh.watchEnabled()
+    check(!off, "watching can be turned off")
+
+    // Unmounted volume: the root disappears, nothing is pruned.
+    let before = try await lib.withDB { db in try db.scalar("SELECT count(*) FROM media") }
+    let moved = tmp.appendingPathComponent("watched-unplugged")
+    try fm.moveItem(at: root, to: moved)
+    let r6 = try await scanner.scan(folders: [a, root.path])
+    let left = try await lib.withDB { db in try db.scalar("SELECT count(*) FROM media") }
+    check(r6.removed == 0 && left == before, "a missing root is left untouched: \(r6), \(String(describing: left)) media")
+} catch { check(false, "auto-scan threw \(error)") }
 
 print("\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

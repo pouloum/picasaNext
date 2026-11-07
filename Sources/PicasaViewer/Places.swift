@@ -11,7 +11,9 @@ struct PlacesView: View {
     @State private var clusters: [GeoCluster] = []
     @State private var selected: GeoCluster?
     @State private var visibleIds: [Int64] = []
-    @State private var position: MapCameraPosition = .automatic
+    /// Starts on France, never `.automatic`: an automatic camera fits every annotation, so while the
+    /// clusters arrive it zooms out to the whole world as soon as one photo was taken abroad.
+    @State private var position: MapCameraPosition = .region(PlacesView.france)
     @State private var region: MKCoordinateRegion?
     @State private var loaded = false
     @State private var clusterTask: Task<Void, Never>?
@@ -96,7 +98,7 @@ struct PlacesView: View {
             // unless a link asked for a place (then the camera is already there: keep it).
             if let p = model.openPlace { centre(on: p) }
             else if centred { recluster() }
-            else if first || region == nil { fitAll() } else { recluster() }
+            else if first || region == nil { fitAll() } else { recluster() } // first load: France
         }
     }
 
@@ -112,18 +114,13 @@ struct PlacesView: View {
         recluster()
     }
 
-    /// Initial camera: the box around every geotagged photo.
+    /// Initial camera: metropolitan France, whatever the spread of the photos (fitting every
+    /// geotagged photo zoomed out to the whole world as soon as one was taken abroad).
+    static let france = MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: 46.6, longitude: 2.4),
+                                           span: MKCoordinateSpan(latitudeDelta: 10.5, longitudeDelta: 13))
+
     func fitAll() {
-        guard let first = points.first else { return }
-        var (minLat, maxLat, minLon, maxLon) = (first.lat, first.lat, first.lon, first.lon)
-        for p in points {
-            minLat = min(minLat, p.lat); maxLat = max(maxLat, p.lat)
-            minLon = min(minLon, p.lon); maxLon = max(maxLon, p.lon)
-        }
-        let r = MKCoordinateRegion(
-            center: CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2, longitude: (minLon + maxLon) / 2),
-            span: MKCoordinateSpan(latitudeDelta: min(170, max(0.02, (maxLat - minLat) * 1.3)),
-                                   longitudeDelta: min(350, max(0.02, (maxLon - minLon) * 1.3))))
+        let r = Self.france
         position = .region(r)
         region = r
         recluster()

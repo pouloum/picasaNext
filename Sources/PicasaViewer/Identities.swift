@@ -34,7 +34,6 @@ struct IdentitiesView: View {
     @State private var photoIds: [Int64] = []
     @State private var photoSections: [GridSection] = []
     @State private var loaded = false
-    @State private var clusterKey: [Int64] = []
 
     @State private var selectedId: Int64?
     @State private var sheet: ClusterTarget?
@@ -166,8 +165,8 @@ struct IdentitiesView: View {
         } else if counts.named + counts.unnamed + counts.ignored == 0 {
             ContentUnavailableView(kind == .face ? "No faces yet" : "No animals yet", systemImage: kind.placeholder,
                                    description: Text(kind == .face
-                                       ? "Run the analysis (picasa-cli analyze), import Picasa data, or name faces in the viewer."
-                                       : "Run the analysis (picasa-cli analyze): cats and dogs are detected, then you name them here."))
+                                       ? "Run the analysis (Processing ▸ Analyze Pending Images), import Picasa data, or name faces in the viewer."
+                                       : "Run the analysis (Processing ▸ Analyze Pending Images): cats and dogs are detected, then you name them here."))
         } else if photosMode {
             if photoIds.isEmpty { emptySelection } else {
                 YearGrid(ids: photoIds, sections: photoSections, resetKey: [kind.rawValue, String(year), "\(showNamed)\(showUnnamed)\(showIgnored)"],
@@ -430,8 +429,9 @@ struct IdentitiesView: View {
         // Everything is read first, then shown at once — and not at all if a newer load started
         // meanwhile (edits come in bursts: an older, slower load must not overwrite fresh counts).
         let c = (try? await lib.identityCounts(kind, year: y)) ?? (0, 0, 0)
-        let d = (try? await lib.duplicateOwners(kind)) ?? []
         let o = (try? await lib.owners(kind, year: y)) ?? []
+        // Same-name people are looked for over all years: reuse the list when it is that one.
+        let d = y == nil ? Library.duplicateGroups(o) : ((try? await lib.duplicateOwners(kind)) ?? [])
         guard !Task.isCancelled else { return }
         counts = c; duplicates = d; owners = o
         if photosMode {
@@ -440,14 +440,12 @@ struct IdentitiesView: View {
             photoIds = rows.map(\.id)
             photoSections = GridSection.byYear(rows.map(\.year))
         } else {
-            // Clustering is the expensive part: only redo it when the items or the year changed.
-            let key = ((try? await lib.identityToken(kind)) ?? []) + [Int64(year), showUnnamed ? 1 : 0, showIgnored ? 1 : 0]
-            if key != clusterKey {
-                let cl = showUnnamed ? ((try? await lib.identityClusters(kind, year: y)) ?? []) : []
-                let ig = showIgnored ? ((try? await lib.identityClusters(kind, ignored: true, year: y)) ?? []) : []
-                guard !Task.isCancelled else { return }
-                clusters = cl; ignoredClusters = ig; clusterKey = key
-            }
+            // Clustering is the expensive part: the model keeps the groups (across visits of the page)
+            // until the items change.
+            let cl = showUnnamed ? await model.clusters(kind, ignored: false, year: y) : []
+            let ig = showIgnored ? await model.clusters(kind, ignored: true, year: y) : []
+            guard !Task.isCancelled else { return }
+            clusters = cl; ignoredClusters = ig
         }
         loaded = true
     }
@@ -959,6 +957,31 @@ extension GridFrames {
                 if r.ignored { return ignored ? f(.systemGray, dashed: true, width: 1.5, target: true) : nil }
                 if r.personId != nil { return named ? f(color, dashed: false, target: true) : f(.white.withAlphaComponent(0.55), dashed: false, width: 1) }
                 return unnamed ? f(.white, dashed: true, target: true) : f(.white.withAlphaComponent(0.55), dashed: true, width: 1)
+            }
+        }, crop: crop)
+    }
+}
+
+extension GridFrames {
+    /// Frame colour of Last indexed ▸ Faces / Animals: full colour when a person made or confirmed
+    /// the region, a lighter tint of it when it is the detector's alone.
+    static func detectionColor(_ k: IdentityKind, human: Bool) -> NSColor {
+        let c: NSColor = k == .face ? .systemGreen : .systemOrange
+        return human ? c : (c.blended(withFraction: 0.45, of: .white) ?? c)
+    }
+
+    /// Frames for Last indexed ▸ Faces / Animals: every region of the photo, solid and thicker when a
+    /// person drew, tagged or confirmed it, dashed and lighter when only the detector found it;
+    /// ignored ones thin and grey.
+    static func detections(_ lib: Library, _ k: IdentityKind, crop: Bool = false) -> GridFrames {
+        GridFrames(id: "detections:\(k.rawValue)", load: { mediaId in
+            let regions = (try? await lib.regions(k, mediaId: mediaId)) ?? []
+            return regions.map { r in
+                let (color, dashed, width): (NSColor, Bool, CGFloat) = r.ignored
+                    ? (.systemGray, true, 1)
+                    : (detectionColor(k, human: r.human), !r.human, r.human ? 2.5 : 1.5)
+                return GridFrame(x: r.x, y: r.y, w: r.w, h: r.h, color: color, dashed: dashed, width: width,
+                                 target: !r.ignored, regionId: r.id, kind: k)
             }
         }, crop: crop)
     }

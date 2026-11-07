@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 import PicasaCore
 
 enum SidebarItem: Hashable {
@@ -9,6 +10,21 @@ enum SidebarItem: Hashable {
     case relations
     case labels
     case places
+    /// The root folders added to the library (cards with their counts and progress).
+    case roots
+}
+
+/// A root folder's card: its counts, and where its volume stands now.
+struct RootCard: Identifiable, Equatable {
+    var stats: Library.RootStats
+    /// False when its disk or share is not mounted (unplugged NAS / disk): its photos stay in the library.
+    var available: Bool
+    var volume: StorageKind
+    var id: Int64 { stats.id }
+    var name: String {
+        let n = (stats.path as NSString).lastPathComponent
+        return n.isEmpty || n == "/" ? stats.path : n
+    }
 }
 
 @MainActor
@@ -63,6 +79,12 @@ final class AppModel: ObservableObject {
     @Published var viewing: Int? // index into viewerIds
     @Published var job: String?
     @Published var jobDetail: String?
+    /// The running job's last progress report: its stage and the file (or folder) it was on.
+    @Published var jobStage: String?
+    @Published var jobDone = 0
+    @Published var jobCurrent: String?
+    /// Sidebar ▸ Folders: one card per root folder, refreshed with the rest (refreshAll).
+    @Published var rootCards: [RootCard] = []
     @Published var error: String?
     /// Bumped each time the library changed (a scan in the app or in picasa-cli): views that load
     /// their own data (people, labels, places) reload on it.
@@ -71,6 +93,44 @@ final class AppModel: ObservableObject {
     @Published var loaded = false
     /// The library is being written by someone else (picasa-cli in a terminal): changes seen recently.
     @Published var externalActivity = false
+    /// Library ▸ Last indexed: photos last indexed, or with the faces / animals / labels found last (remembered).
+    @Published var recentKind: RecentKind = RecentKind(rawValue: UserDefaults.standard.string(forKey: "recent.kind") ?? "") ?? .indexed {
+        didSet {
+            guard recentKind != oldValue else { return }
+            UserDefaults.standard.set(recentKind.rawValue, forKey: "recent.kind")
+            Task { await reloadGrid() }
+        }
+    }
+    /// The kind the grid's ids were loaded for (switches with them, so the grid resets once, on the new list).
+    @Published private(set) var shownRecentKind: RecentKind = .indexed
+    /// Processing ▸ Performance Profile: how index / analysis adapt to the machine and the disks.
+    /// Saved in the library (shared with picasa-cli), applied from the next batch run.
+    @Published var throughputProfile: ThroughputProfile = .auto {
+        didSet {
+            guard throughputProfile != oldValue else { return }
+            let (lib, p) = (library, throughputProfile)
+            Task { try? await lib.setThroughputProfile(p) }
+        }
+    }
+
+    /// Settings ▸ Library ▸ Watch folders for new items (Watch.swift). Saved in the library.
+    @Published var watchFolders = true {
+        didSet {
+            guard watchFolders != oldValue, !loadingWatchSetting else { return }
+            let (lib, on) = (library, watchFolders)
+            Task {
+                try? await lib.setWatchEnabled(on)
+                if on { await startWatching(catchUp: true) } else { stopWatching() }
+            }
+        }
+    }
+    private var loadingWatchSetting = false
+    let autoScan = AutoScanState()
+
+    func forgetTuning() {
+        let lib = library
+        Task { _ = try? await lib.resetTuning() }
+    }
     let thumbs: ThumbnailCache
     private var lastToken: [Int64] = []
     private var refreshing = false
@@ -86,17 +146,34 @@ final class AppModel: ObservableObject {
         do { library = try Library(root: Self.libraryURL) } catch { fatalError("Cannot open library: \(error)") }
         thumbs = ThumbnailCache(store: library.thumbs)
         Task {
+            if let p = try? await library.throughputProfile(), p != throughputProfile { throughputProfile = p }
+            if let on = try? await library.watchEnabled(), on != watchFolders {
+                loadingWatchSetting = true; watchFolders = on; loadingWatchSetting = false
+            }
             // The grid first (what the user looks at), then the sidebar and counters.
             await loadRotations()
             await reloadGrid()
             loaded = true
             await refreshAll()
+            // Ready before they are asked for: the face groups of People and the Labels cards
+            // (each a second or two of work on a large library, done once here instead of on opening).
+            // Later and at background priority, so it never competes with the first scrolls of the grid
+            // (thumbnail decoding runs at .userInitiated).
+            Task(priority: .background) { [weak self] in
+                try? await Task.sleep(for: .seconds(20))
+                guard let self, self.job == nil else { return }
+                _ = await self.clusters(.face, ignored: false, year: nil)
+                try? await self.library.refreshLabelInfo()
+            }
             // After an upgrade (or on a library indexed by an older picasa-cli): build the groups.
             if (try? await library.groupsNeedRebuild()) == true {
                 runJob("Finding duplicates, bursts and similar photos") { lib, _ in _ = try await lib.groupSimilar() }
             }
             // Debugging aid: PICASANEXT_OPEN_FIRST=1 opens the first photo at launch.
             if ProcessInfo.processInfo.environment["PICASANEXT_OPEN_FIRST"] != nil { open(ids, at: 0) }
+            // What was added while the app was closed, then new items as they arrive (after the
+            // group rebuild above, if any: the scan waits for it).
+            await startWatching(catchUp: true)
             await watchLibrary()
         }
     }
@@ -151,9 +228,27 @@ final class AppModel: ObservableObject {
             vocabulary = try await library.searchVocabulary()
             albums = try await library.albums()
             stats = try await library.stats()
+            await loadRootCards()
         } catch { self.error = "\(error)" }
         await reloadGrid()
         revision += 1
+    }
+
+    /// The roots' counts (one grouped query), then whether each volume is mounted, read off the main
+    /// thread (a network share can be slow to answer; VolumeInfo caches the volume per mount point).
+    func loadRootCards() async {
+        guard let rows = try? await library.rootStats() else { return }
+        let cards = await Task.detached(priority: .utility) {
+            rows.map { RootCard(stats: $0, available: FileManager.default.fileExists(atPath: $0.path), volume: VolumeInfo.of($0.path).kind) }
+        }.value
+        if cards != rootCards { rootCards = cards }
+    }
+
+    /// The root the running job is working in (from its last progress report), if any.
+    var activeRootId: Int64? {
+        guard job != nil, let cur = jobCurrent else { return nil }
+        return rootCards.filter { cur == $0.stats.path || cur.hasPrefix($0.stats.path.hasSuffix("/") ? $0.stats.path : $0.stats.path + "/") }
+            .max { $0.stats.path.count < $1.stats.path.count }?.id
     }
 
     func open(_ list: [Int64], at index: Int) {
@@ -163,7 +258,7 @@ final class AppModel: ObservableObject {
     }
 
     func reloadGrid() async {
-        if !isSearching, selection == .people || selection == .pets || selection == .relations || selection == .labels || selection == .places { return }
+        if !isSearching, selection == .people || selection == .pets || selection == .relations || selection == .labels || selection == .places || selection == .roots { return }
         let f = currentFilter
         let kind: GroupKind? = { switch f { case .bursts: .burst; case .similar: .similar; case .duplicates: .duplicates; default: nil } }()
         if let kind {
@@ -178,9 +273,11 @@ final class AppModel: ObservableObject {
         }
         groups = []
         do {
-            let rows = try await library.mediaIdsAndYears(f)
+            let kind = recentKind
+            let rows = try await library.mediaIdsAndYears(f, recent: kind)
             let grouped: Bool = { switch f { case .recent: true; default: false } }()
             sections = grouped ? [] : GridSection.byYear(rows.map(\.year))
+            if shownRecentKind != kind { shownRecentKind = kind }
             ids = rows.map(\.id)
         } catch { self.error = "\(error)"; ids = []; sections = [] }
     }
@@ -200,11 +297,6 @@ final class AppModel: ObservableObject {
         if !gridSelection.isEmpty { return true }
         if case .filter(.folder, _)? = selection { return true }
         return false
-    }
-
-    /// Names the places of geotagged photos (background job; slow because Apple throttles requests).
-    func geocode() {
-        runJob("Naming places") { lib, report in _ = try await Geocoder(library: lib).run { report($0) } }
     }
 
     func flattenGroups() -> [Int64] {
@@ -234,61 +326,171 @@ final class AppModel: ObservableObject {
 
     // MARK: - Background jobs
 
+    /// File ▸ Add Folder…: the panel has an Exclude field (folder names or paths, comma-separated),
+    /// remembered like picasa-cli scan --exclude.
     func addFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         panel.prompt = "Add to library"
+        let field = NSTextField(string: "")
+        field.placeholderString = "e.g. Backups, /Volumes/Photos/Old (comma-separated)"
+        field.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        let note = NSTextField(labelWithString: "Exclude folders:")
+        let row = NSStackView(views: [note, field])
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        panel.accessoryView = row
+        panel.isAccessoryViewDisclosed = true
         guard panel.runModal() == .OK else { return }
         let urls = panel.urls
+        let excludes = field.stringValue.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         runJob("Scanning") { lib, report in
-            for u in urls {
-                _ = try await Scanner(library: lib).scan(root: u) { report($0) }
-            }
+            _ = try await Pipeline.scan(lib, roots: urls, excludes: excludes, progress: report)
             try await Self.index(lib, report)
         }
     }
 
     func rescan() {
         runJob("Rescanning") { lib, report in
-            // Missing roots (unplugged disk) are skipped, never pruned.
-            for r in try await lib.roots() where FileManager.default.fileExists(atPath: r.path) {
-                _ = try await Scanner(library: lib).scan(root: URL(fileURLWithPath: r.path)) { report($0) }
-            }
+            _ = try await Pipeline.rescan(lib, progress: report)
             try await Self.index(lib, report)
         }
     }
 
+    /// Rescans one root folder (Folders card ▸ Scan Again), then indexes what is new.
+    func rescan(root path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        runJob("Rescanning") { lib, report in
+            _ = try await Pipeline.scan(lib, roots: [URL(fileURLWithPath: path)], progress: report)
+            try await Self.index(lib, report)
+        }
+    }
+
+    /// File ▸ Import Picasa Data…: a Picasa2 / Picasa3 folder (contacts, and db3 if present).
     func importPicasa() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.message = "Choose the Picasa2 / Picasa3 folder (contacts, and db3 if you have it)."
+        let reuse = NSButton(checkboxWithTitle: "Reuse Picasa's thumbnails (faster; unchecked: made again from the photos)", target: nil, action: nil)
+        reuse.state = .on
+        let box = NSStackView(views: [reuse])
+        box.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        panel.accessoryView = box
+        panel.isAccessoryViewDisclosed = true
         guard panel.runModal() == .OK, let dir = panel.url else { return }
+        let thumbs = reuse.state == .on
         runJob("Importing Picasa data") { lib, report in
-            let fm = FileManager.default
-            // contacts.xml (person names) is enough on its own; db3 is optional.
-            for c in ["contacts/contacts.xml", "contacts.xml"] where fm.fileExists(atPath: dir.appendingPathComponent(c).path) {
-                _ = try await lib.importContacts(at: dir.appendingPathComponent(c)); break
-            }
-            for d in [dir.appendingPathComponent("db3"), dir] where fm.fileExists(atPath: d.appendingPathComponent("thumbindex.db").path) {
-                _ = try await lib.importDB3(at: d) { report($0) }; break
-            }
-            // Names imported on a hidden copy go to the photo kept (and on to its other copies).
-            try await lib.mirrorToCopies(.face)
-            _ = try await FaceEngine(library: lib).suggestNames()
+            _ = try await Pipeline.importPicasaFolder(lib, at: dir, reuseThumbnails: thumbs, progress: report)
         }
     }
 
+    /// File ▸ Import Contacts File…: a Picasa contacts.xml on its own (person names).
+    func importContacts() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.xml]
+        panel.message = "Choose a Picasa contacts.xml file (person names)."
+        guard panel.runModal() == .OK, let file = panel.url else { return }
+        runJob("Importing contacts") { lib, _ in
+            let n = try await lib.importContacts(at: file)
+            _ = try await FaceEngine(library: lib).suggestNames()
+            await MainActor.run { [weak self] in self?.notice = "\(n) contacts imported." }
+        }
+    }
+
+    /// Indexing then analysis of everything pending, with the saved profile and sizes (what a scan runs after).
     nonisolated static func index(_ lib: Library, _ report: @escaping ProgressHandler) async throws {
-        let ix = Indexer(library: lib)
-        _ = try await ix.run { report($0) }
-        _ = try await Analyzer(library: lib, concurrency: max(1, ProcessInfo.processInfo.activeProcessorCount / 2)).run { report($0) }
-        _ = try await FaceEngine(library: lib).suggestNames()
-        _ = try await Analyzer(library: lib).petPrints { report($0) }
-        _ = try await IdentityEngine.suggest(library: lib, kind: .pet, threshold: 0.82)
-        try await lib.groupSimilar()
+        try await indexOnly(lib, report)
+        try await analyze(lib, report)
+    }
+
+    nonisolated static func indexOnly(_ lib: Library, redoThumbs: Bool = false, _ report: @escaping ProgressHandler) async throws {
+        // Read here, not passed in: a profile chosen in a terminal (picasa-cli profile) applies too.
+        let profile = (try? await lib.throughputProfile()) ?? .auto
+        var indexer = Indexer(library: lib, profile: profile)
+        try await indexer.useSavedSizes()
+        _ = try await Pipeline.index(indexer, redoThumbs: redoThumbs, progress: report)
+    }
+
+    nonisolated static func analyze(_ lib: Library, redo: Bool = false, includeManual: Bool = false,
+                                    _ report: @escaping ProgressHandler) async throws {
+        let profile = (try? await lib.throughputProfile()) ?? .auto
+        _ = try await Pipeline.analyze(Analyzer(library: lib, profile: profile), redo: redo, includeManual: includeManual, progress: report)
+        try await lib.refreshLabelInfo() // new labels: the Labels cards are rebuilt here, not on opening
+    }
+
+    /// Processing ▸ Index Pending Items (picasa-cli index).
+    func indexPending(redoThumbs: Bool = false) {
+        runJob(redoThumbs ? "Regenerating thumbnails" : "Indexing") { lib, report in
+            try await Self.indexOnly(lib, redoThumbs: redoThumbs, report)
+        }
+    }
+
+    /// Processing ▸ Analyze Pending Images / Redo Analysis… (picasa-cli analyze [--redo [--include-manual]]).
+    func analyzePending(redo: Bool = false, includeManual: Bool = false) {
+        runJob(redo ? "Analyzing everything again" : "Analyzing") { lib, report in
+            try await Self.analyze(lib, redo: redo, includeManual: includeManual, report)
+        }
+    }
+
+    /// Processing ▸ Find Similar Photos (picasa-cli similar), with the saved threshold.
+    func findSimilar() {
+        runJob("Finding duplicates, bursts and similar photos") { lib, _ in _ = try await Pipeline.similar(lib) }
+    }
+
+    /// Processing ▸ Recompute Name Suggestions (picasa-cli suggest).
+    func suggestNames() {
+        runJob("Suggesting names") { lib, _ in
+            let (f, p) = try await Pipeline.suggest(lib)
+            await MainActor.run { [weak self] in self?.notice = "Name suggestions: \(f) faces, \(p) animals." }
+        }
+    }
+
+    /// Names the places of geotagged photos (background job; slow because Apple throttles requests),
+    /// at most the limit set in Settings ▸ Places.
+    func geocode() {
+        runJob("Naming places") { lib, report in
+            let limit = try await lib.geocodeLimit() ?? .max
+            let r = try await Geocoder(library: lib).run(limit: limit) { report($0) }
+            await MainActor.run { [weak self] in self?.notice = "Places: \(r.named) named, \(r.failed) failed, \(r.left) left." }
+        }
+    }
+
+    /// People and pets sharing a name, merged in one job (Processing ▸ Merge Duplicate Names…).
+    func mergeDuplicateNames(_ groups: [(kind: IdentityKind, groups: [[PersonSummary]])]) {
+        runJob("Merging duplicate names") { lib, _ in _ = try await Pipeline.mergeDuplicates(lib, groups) }
+    }
+
+    /// A one-line message after a job (contacts imported, places named…), shown in an alert.
+    @Published var notice: String?
+
+    /// Sheets opened from the menus (shown by RootView).
+    enum Sheet: String, Identifiable {
+        case export, mergeNames, plan, redoAnalysis, redoThumbnails
+        var id: String { rawValue }
+    }
+    @Published var sheet: Sheet?
+
+    /// Settings ▸ Library: forgets a root and its index (photos untouched).
+    func removeRoot(_ path: String) {
+        runJob("Removing \((path as NSString).lastPathComponent)") { lib, _ in _ = try await lib.removeRoot(path) }
+    }
+    // MARK: - Unnamed groups (People / Animals)
+
+    /// Groups of unnamed (or ignored) faces / animals, kept across visits of the page: recomputed
+    /// only when the items changed (identityToken) — not on each switch of the page's filters.
+    private var clusterCache: [String: (token: [Int64], clusters: [FaceCluster])] = [:]
+
+    func clusters(_ k: IdentityKind, ignored: Bool, year: Int?) async -> [FaceCluster] {
+        let token = (try? await library.identityToken(k)) ?? []
+        let key = "\(k.rawValue):\(ignored):\(year ?? 0)"
+        if let c = clusterCache[key], c.token == token { return c.clusters }
+        let value = (try? await library.identityClusters(k, ignored: ignored, year: year)) ?? []
+        clusterCache[key] = (token, value)
+        return value
     }
 
     /// Animals can only be grouped and suggested once they have a print: compute the missing ones
@@ -298,25 +500,41 @@ final class AppModel: ObservableObject {
         petPrintsTried = true
         runJob("Recognising pets") { lib, report in
             _ = try await Analyzer(library: lib).petPrints { report($0) }
-            _ = try await IdentityEngine.suggest(library: lib, kind: .pet, threshold: 0.82)
+            _ = try await IdentityEngine.suggest(library: lib, kind: .pet, threshold: Pipeline.petThreshold)
         }
     }
     private var petPrintsTried = false
 
-    private func runJob(_ title: String, _ body: @escaping @Sendable (Library, @escaping ProgressHandler) async throws -> Void) {
+    func runJob(_ title: String, _ body: @escaping @Sendable (Library, @escaping ProgressHandler) async throws -> Void) {
         guard job == nil else { return }
+        Task { _ = await runJobAwaiting(title, body) }
+    }
+
+    /// A background job whose result the caller waits for (an export dry run shown in its sheet):
+    /// the toolbar shows its title and progress like any other. nil if another job is running or it failed.
+    func runJobAwaiting<T: Sendable>(_ title: String, _ body: @escaping @Sendable (Library, @escaping ProgressHandler) async throws -> T) async -> T? {
+        guard job == nil else { return nil }
         job = title
         let lib = library
-        Task {
-            let report: ProgressHandler = { p in
-                let text = "\(p.stage) \(p.done)\(p.total.map { "/\($0)" } ?? "")"
-                Task { @MainActor [weak self] in self?.jobDetail = text }
+        let report: ProgressHandler = { p in
+            let text = "\(p.stage) \(p.done)\(p.total.map { "/\($0)" } ?? "")"
+            Task { @MainActor [weak self] in
+                guard let self, self.job != nil else { return } // a late report after the job ended
+                self.jobDetail = text
+                self.jobStage = p.stage
+                self.jobDone = p.done
+                if let c = p.current { self.jobCurrent = c }
             }
-            do { try await body(lib, report) } catch { self.error = "\(error)" }
-            job = nil
-            jobDetail = nil
-            await refreshAll()
         }
+        var result: T?
+        do { result = try await body(lib, report) } catch { self.error = "\(error)" }
+        job = nil
+        jobDetail = nil
+        jobStage = nil
+        jobCurrent = nil
+        await refreshAll()
+        await watchAfterJob()
+        return result
     }
 
     // MARK: - Edits

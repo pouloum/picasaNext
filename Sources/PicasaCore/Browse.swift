@@ -52,6 +52,15 @@ public struct FaceRecord: Sendable, Identifiable, Hashable {
     public let suggestedPersonId: Int64?
     public let personName: String?
     public var ignored = false
+    /// Drawn, tagged or confirmed by a person (a Picasa or hand-drawn face, a named / ignored /
+    /// confirmed region) rather than only found by the detector.
+    public var human = false
+}
+
+/// What Library ▸ Last indexed lists, newest first: the photos last indexed, or those whose faces,
+/// animals or Vision labels were found last.
+public enum RecentKind: String, Sendable, Hashable, CaseIterable {
+    case indexed, faces, animals, labels
 }
 
 /// A structured search criterion (a search token in the UI). Several are combined with AND.
@@ -172,6 +181,8 @@ public enum MediaFilter: Sendable, Hashable {
     case label(String)
     /// Search: every term AND every word of the free text must match.
     case query([SearchTerm], String)
+    /// Everything under a root folder added with `scan` (the Folders cards), subfolders included.
+    case root(Int64)
 }
 
 extension Library {
@@ -193,6 +204,7 @@ extension Library {
         switch f {
         case .all: return ("1", [])
         case let .folder(id): return ("m.folder_id = ?", [id])
+        case let .root(id): return ("f.root_id = ?", [id])
         case let .person(id): return ("m.id IN (SELECT media_id FROM faces WHERE person_id = ?)", [id])
         case let .personSuggestions(id): return ("m.id IN (SELECT media_id FROM faces WHERE person_id IS NULL AND suggested_person_id = ?)", [id])
         case let .album(id): return ("m.id IN (SELECT media_id FROM album_items WHERE album_id = ?)", [id])
@@ -218,7 +230,7 @@ extension Library {
             if ignored { kinds.append("t.ignored = 1") }
             guard !kinds.isEmpty else { return ("0", []) }
             let (yc, ya) = yearClause(year)
-            return ("m.id IN (SELECT t.media_id FROM \(k.table) t WHERE \(kinds.joined(separator: " OR ")))" + yc, ya)
+            return ("m.id IN (SELECT t.media_id FROM \(k.table) t INDEXED BY \(k.identIndex) WHERE \(kinds.joined(separator: " OR ")))" + yc, ya)
         case .utility: return ("m.utility = 1", [])
         case .ignored: return ("m.ignored = 1", [])
         case .bursts: return ("m.id IN (SELECT media_id FROM bursts)", [])
@@ -271,19 +283,6 @@ extension Library {
         return (clause, Array(repeating: like, count: 13))
     }
 
-    /// Every label and keyword with its photo count and the best-looking photo as cover, most used first.
-    public func labelSummaries() throws -> [LabelSummary] {
-        try db.all("""
-            SELECT label, n, media_id FROM (
-              SELECT l.label, l.media_id, count(*) OVER (PARTITION BY l.label) n,
-                     row_number() OVER (PARTITION BY l.label ORDER BY m.aesthetic DESC NULLS LAST, m.taken_at DESC) rn
-              FROM (SELECT media_id, label FROM labels UNION SELECT media_id, tag FROM tags) l
-              JOIN media m ON m.id = l.media_id
-              WHERE m.ignored = 0 AND m.hidden = 0)
-            WHERE rn = 1 ORDER BY n DESC, label
-            """) { LabelSummary(label: $0.text(0), count: Int($0.int(1)), coverMediaId: $0.int(2)) }
-    }
-
     /// Everything that can become a search token, most used first: named people, labels/keywords, albums.
     /// Small enough (a few thousand entries) to keep in memory for instant autocompletion.
     public func searchVocabulary() throws -> [SearchTerm] {
@@ -292,10 +291,14 @@ extension Library {
             SELECT p.id, p.name FROM persons p WHERE p.name != '' AND p.merged_into IS NULL
             ORDER BY (SELECT count(*) FROM faces WHERE person_id = p.id) DESC
             """) { .person($0.int(0), $0.text(1)) }
-        out += try db.all("""
-            SELECT label FROM (SELECT label, count(*) n FROM labels GROUP BY label UNION ALL SELECT tag, count(*) FROM tags GROUP BY tag)
-            GROUP BY label ORDER BY sum(n) DESC
-            """) { .label($0.text(0)) }
+        // From label_info (a few hundred rows; possibly a little stale during a scan, rebuilt after it);
+        // counted from the 1M+ labels only before its first build.
+        out += try !hasLabelInfo()
+            ? db.all("""
+                SELECT label FROM (SELECT label, count(*) n FROM labels GROUP BY label UNION ALL SELECT tag, count(*) FROM tags GROUP BY tag)
+                GROUP BY label ORDER BY sum(n) DESC
+                """) { .label($0.text(0)) }
+            : db.all("SELECT label FROM label_info ORDER BY n DESC, label") { .label($0.text(0)) }
         out += try db.all("SELECT id, name FROM albums ORDER BY name") { .album($0.int(0), $0.text(1)) }
         return out
     }
@@ -327,7 +330,8 @@ extension Library {
     public func mediaIds(_ filter: MediaFilter) throws -> [Int64] { try mediaIdsAndYears(filter).map(\.id) }
 
     /// Same as `mediaIds`, with each item's year (0 = undated), for year sections in the grids.
-    public func mediaIdsAndYears(_ filter: MediaFilter) throws -> [(id: Int64, year: Int)] {
+    /// `recent`: what Last indexed (`.recent`) orders by; ignored by the other filters.
+    public func mediaIdsAndYears(_ filter: MediaFilter, recent: RecentKind = .indexed) throws -> [(id: Int64, year: Int)] {
         var (w, args) = whereClause(filter)
         let row: (Database.Row) -> (id: Int64, year: Int) = { ($0.int(0), Int($0.int(1))) }
         // Dates in the future (a camera clock never set: 2037…) count as no date: section "No date", at the end.
@@ -342,9 +346,19 @@ extension Library {
         let grouped: GroupKind? = { switch filter { case .bursts: .burst; case .similar: .similar; case .duplicates: .duplicates; default: nil } }()
         if let k = grouped { return try mediaGroups(k).flatMap(\.members).map { ($0, 0) } }
         if case .recent = filter {
+            // Faces / animals: newest region of each photo, on the (media_id, rowid) covering indexes
+            // (the rows hold 3 KB prints). Labels: only the latest 100k (1M+ rows, ~12 per photo).
+            let (join, order): (String, String) = switch recent {
+            case .indexed: ("", "m.indexed_at DESC, m.id DESC")
+            case .faces: ("JOIN (SELECT media_id, max(id) k FROM faces INDEXED BY faces_media GROUP BY media_id) r ON r.media_id = m.id", "r.k DESC")
+            case .animals: ("JOIN (SELECT media_id, max(id) k FROM animals INDEXED BY animals_media GROUP BY media_id) r ON r.media_id = m.id", "r.k DESC")
+            case .labels:
+                ("JOIN (SELECT media_id, max(rowid) k FROM (SELECT rowid, media_id FROM labels ORDER BY rowid DESC LIMIT 100000) GROUP BY media_id) r ON r.media_id = m.id",
+                 "r.k DESC")
+            }
             return try db.all("""
-                SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w)
-                ORDER BY m.indexed_at DESC, m.id DESC LIMIT 2000
+                SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id \(join) WHERE \(w)
+                ORDER BY \(order) LIMIT 2000
                 """, args, row)
         }
         if case .similar = filter {
@@ -355,7 +369,16 @@ extension Library {
                   s.group_id, m.aesthetic DESC, m.size DESC
                 """, args, row)
         }
-        return try db.all("SELECT m.id, \(year) FROM media m JOIN folders f ON f.id = m.folder_id WHERE \(w) "
+        // Filters that only test m.id / m.taken_at: read media through the covering index media_visible,
+        // never the rows (3 KB prints each: probing 50k photos by id read ~200 MB from disk).
+        let covered: Bool = {
+            switch filter {
+            case .person, .personSuggestions, .album, .animals, .pet, .petSuggestions, .identities, .label, .year: true
+            case let .query(_, text): text.trimmingCharacters(in: .whitespaces).isEmpty
+            default: false
+            }
+        }()
+        return try db.all("SELECT m.id, \(year) FROM media m \(covered ? "INDEXED BY media_visible " : "")JOIN folders f ON f.id = m.folder_id WHERE \(w) "
                           + "ORDER BY (m.taken_at IS NULL OR m.taken_at > \(future)), m.taken_at DESC, m.id DESC", args, row)
     }
 
@@ -450,6 +473,7 @@ extension Library {
 
     /// Photos shown turned (Picasa or here): id → quarter turns clockwise.
     public func rotations() throws -> [Int64: Int] {
+        // Same WHERE as the partial index media_rotated (a few hundred rows, no table scan).
         Dictionary(uniqueKeysWithValues: try db.all("SELECT id, rotate FROM media WHERE rotate % 4 != 0") { ($0.int(0), Int($0.int(1)) % 4) })
     }
 

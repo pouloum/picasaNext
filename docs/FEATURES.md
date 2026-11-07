@@ -288,8 +288,10 @@ Options globales : `--library DIR`, `-j N`.
 
 | Opération | Mesure |
 |---|---|
-| Démarrage (compteurs + grille) | < 1 s (index couvrants ; avant : ~5 s) |
-| Grille All | 131 ms de requête (avant index : 745 ms), mesuré le 23 oct. avant le masquage des copies |
+| Démarrage (compteurs + grille) | < 1 s (index couvrants ; avant : ~5 s). Régression à ~5 s après le masquage des copies, corrigée le 6 nov. (schéma v13, voir `docs/PERF.md`) |
+| Grille All | 43 ms de requête (avant v13 : 15 s à froid, chaque ligne relue pour `dup_of`) ; rotations 1 ms (avant : lecture complète de la table) |
+| People / Animals (bascule Groups / To identify) | comptages 0,03 s, personnes 0,02 s, sélection des visages à regrouper 0,03 s (avant : 10–18 s chacun à froid) ; groupes gardés en mémoire et préparés au lancement |
+| Labels | cartes précalculées (`label_info`) : ouverture < 5 ms ; reconstruction ~1,5–5 s après une analyse, en tâche de fond (avant : 21 s à chaque ouverture) |
 | Ouverture Bursts / Similar / Duplicates | 0,16 / 0,11 / 0,4 s (avant : 20 s pour Bursts) |
 | Regroupements complets | ~20–25 s (64 120 groupes de doublons, 91 244 copies masquées) |
 | Suggestions (100 000 visages) | ~1,8 s |

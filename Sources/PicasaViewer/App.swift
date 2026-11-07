@@ -36,6 +36,16 @@ struct PicasaNextApp: App {
         }
     }
 
+    static func profileLabel(_ p: ThroughputProfile) -> String {
+        switch p {
+        case .auto: "Automatic (from each disk)"
+        case .ssd: "SSD"
+        case .hdd: "Hard Disk"
+        case .nas: "Network Share (NAS)"
+        case .eco: "Economy (1–2 files at a time)"
+        }
+    }
+
     var body: some Scene {
         WindowGroup("PicasaNext") {
             RootView().environmentObject(model)
@@ -44,9 +54,51 @@ struct PicasaNextApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 Button("Add Folder to Library…") { model.addFolder() }.keyboardShortcut("o")
-                Button("Import Picasa Data…") { model.importPicasa() }
                 Button("Rescan Library") { model.rescan() }.keyboardShortcut("r")
+                Divider()
+                Button("Import Picasa Data…") { model.importPicasa() }
+                Button("Import Contacts File…") { model.importContacts() }
+                Divider()
+                Button("Export Edits to Photo Folders…") { model.sheet = .export }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
             }
+            CommandMenu("Processing") {
+                // What a scan runs after, one stage at a time (picasa-cli index / analyze / similar / suggest / geocode).
+                Group {
+                    Button("Index Pending Items") { model.indexPending() }
+                    Button("Analyze Pending Images") { model.analyzePending() }
+                    Button("Find Similar Photos") { model.findSimilar() }
+                    Button("Recompute Name Suggestions") { model.suggestNames() }
+                    Button("Name Places (Geocode)") { model.geocode() }
+                }
+                .disabled(model.job != nil)
+                Divider()
+                Group {
+                    Button("Regenerate All Thumbnails…") { model.sheet = .redoThumbnails }
+                    Button("Redo Analysis…") { model.sheet = .redoAnalysis }
+                    Button("Merge Duplicate Names…") { model.sheet = .mergeNames }
+                }
+                .disabled(model.job != nil)
+                Divider()
+                // Indexing and analysis: parallel files and batch sizes, from the disk of the photos
+                // (Automatic) or forced; tuned during each run and remembered per disk.
+                Menu("Performance Profile") {
+                    Picker("Performance Profile", selection: $model.throughputProfile) {
+                        ForEach(ThroughputProfile.allCases, id: \.self) { p in
+                            Text(Self.profileLabel(p)).tag(p)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
+                }
+                Divider()
+                Button("Show Performance Plan…") { model.sheet = .plan }
+                Button("Forget Tuned Values") { model.forgetTuning() }
+                    .help("The next run starts again from the values of the profile")
+            }
+        }
+        Settings {
+            SettingsView().environmentObject(model)
         }
     }
 }
@@ -70,6 +122,7 @@ struct RootView: View {
                     else if case .relations? = model.selection { RelationsView() }
                     else if case .labels? = model.selection { LabelsView() }
                     else if case .places? = model.selection { PlacesView() }
+                    else if case .roots? = model.selection { RootsView() }
                     else { GridView() }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -113,6 +166,12 @@ struct RootView: View {
         .alert("Error", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK") { model.error = nil }
         } message: { Text(model.error ?? "") }
+        .alert("Done", isPresented: Binding(get: { model.notice != nil && model.error == nil }, set: { if !$0 { model.notice = nil } })) {
+            Button("OK") { model.notice = nil }
+        } message: { Text(model.notice ?? "") }
+        .sheet(item: $model.sheet) { sheet in
+            ToolSheet(sheet: sheet).environmentObject(model)
+        }
     }
 }
 
@@ -195,7 +254,7 @@ struct LibraryStatus: View {
             }
             if s.pendingMeta + s.pendingThumbs + s.pendingAnalysis + s.unreadableThumbs > 0 {
                 Divider().gridCellColumns(2)
-                Text("Missing thumbnails are made as you browse. To finish everything: picasa-cli index, then picasa-cli analyze (unreadable files are retried each time).")
+                Text("Missing thumbnails are made as you browse. To finish everything: Processing ▸ Index Pending Items, then Analyze Pending Images (unreadable files are retried each time).")
                     .font(.caption).foregroundStyle(.secondary).gridCellColumns(2).frame(width: 420, alignment: .leading)
             }
         }
@@ -243,6 +302,8 @@ struct Sidebar: View {
 
     var body: some View {
         List(selection: $selection) {
+            row("Folders", "externaldrive", SidebarItem.roots, badge: model.rootCards.count,
+                help: "The folders added to the library: their photos and videos, last scan and work in progress")
             Section("Library") {
                 row("All photos", "photo.on.rectangle", SidebarItem.filter(.all, "All photos"))
                 row("Last indexed", "clock.badge.checkmark", SidebarItem.filter(.recent, "Last indexed"),
@@ -307,8 +368,34 @@ struct Sidebar: View {
 struct GridView: View {
     @EnvironmentObject private var model: AppModel
     @State private var size: CGFloat = 150
+    @AppStorage("grid.showFrames") private var showFrames = true
+    @AppStorage("grid.frameOnly") private var frameOnly = false
+
+    /// Last indexed (not a search): its filter bar is shown.
+    var isRecent: Bool { model.currentFilter == .recent }
 
     var body: some View {
+        VStack(spacing: 0) {
+            if isRecent {
+                RecentBar()
+                Divider()
+            }
+            grid
+        }
+    }
+
+    /// Faces / animals of Last indexed: frames on the thumbnails, solid when a person drew, tagged or
+    /// confirmed them, dashed and lighter when the detector found them alone.
+    var frames: GridFrames? {
+        guard isRecent, showFrames else { return nil }
+        switch model.shownRecentKind {
+        case .faces: return .detections(model.library, .face, crop: frameOnly)
+        case .animals: return .detections(model.library, .pet, crop: frameOnly)
+        case .indexed, .labels: return nil
+        }
+    }
+
+    @ViewBuilder var grid: some View {
         if !model.loaded {
             ProgressView("Loading the library…").frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.ids.isEmpty {
@@ -317,8 +404,10 @@ struct GridView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             VStack(spacing: 0) {
-                YearGrid(ids: model.ids, sections: model.sections, cellSize: size, resetKey: model.currentFilter,
+                YearGrid(ids: model.ids, sections: model.sections, cellSize: size,
+                         resetKey: isRecent ? AnyHashable(model.shownRecentKind) : AnyHashable(model.currentFilter),
                          onSelect: { sel in model.gridSelection = sel.compactMap { $0 < model.ids.count ? model.ids[$0] : nil } },
+                         frames: frames,
                          badges: model.groups.isEmpty ? [:] : model.groupBadges, expanded: model.expanded,
                          members: model.groups.isEmpty ? [] : model.expandedMembers,
                          onBadge: model.groups.isEmpty ? nil : { model.toggleGroup($0) })
@@ -345,20 +434,71 @@ struct GridView: View {
         }
         switch model.selection {
         case .filter(.estimatedDates, _)?: return ("No estimated dates", "calendar.badge.exclamationmark", "Every indexed photo has a date of its own.")
-        case .filter(.recent, _)?: return ("Nothing indexed yet", "clock.badge.checkmark", "Photos show up here as the indexer makes their thumbnails (picasa-cli index).")
+        case .filter(.recent, _)?:
+            switch model.recentKind {
+            case .indexed: return ("Nothing indexed yet", "clock.badge.checkmark", "Photos show up here as the indexer makes their thumbnails (Processing ▸ Index Pending Items).")
+            case .faces: return ("No faces yet", "person.crop.square", "Faces show up here as the analysis finds them (Processing ▸ Analyze Pending Images), or from Picasa data.")
+            case .animals: return ("No animals yet", "pawprint", "Cats and dogs show up here as the analysis finds them (Processing ▸ Analyze Pending Images).")
+            case .labels: return ("No labels yet", "tag", "Photos show up here as the analysis labels them (Processing ▸ Analyze Pending Images; needs macOS 15 or later).")
+            }
         case .filter(.videos, _)?: return ("No videos", "film", "No video files were found in the scanned folders.")
-        case .filter(.best, _)?: return ("No scores yet", "sparkles", "Run the analysis (picasa-cli analyze) to score photos. Needs macOS 15 or later.")
-        case .filter(.bursts, _)?: return ("No bursts", "square.stack.3d.forward.dottedline", "No series of look-alike shots taken within 2 seconds were found (picasa-cli similar).")
-        case .filter(.similar, _)?: return ("No similar photos", "square.on.square", "No near-duplicates found (picasa-cli analyze, then picasa-cli similar).")
-        case .filter(.duplicates, _)?: return ("No duplicates", "doc.on.doc", "No identical files found (picasa-cli similar).")
-        case .filter(.animals, _)?: return ("No animals", "pawprint", "No cats or dogs found (run picasa-cli analyze first).")
+        case .filter(.best, _)?: return ("No scores yet", "sparkles", "Run the analysis (Processing ▸ Analyze Pending Images) to score photos. Needs macOS 15 or later.")
+        case .filter(.bursts, _)?: return ("No bursts", "square.stack.3d.forward.dottedline", "No series of look-alike shots taken within 2 seconds were found (Processing ▸ Find Similar Photos).")
+        case .filter(.similar, _)?: return ("No similar photos", "square.on.square", "No near-duplicates found (Processing ▸ Analyze Pending Images, then Find Similar Photos).")
+        case .filter(.duplicates, _)?: return ("No duplicates", "doc.on.doc", "No identical files found (Processing ▸ Find Similar Photos).")
+        case .filter(.animals, _)?: return ("No animals", "pawprint", "No cats or dogs found (run Processing ▸ Analyze Pending Images first).")
         case .filter(.ignored, _)?: return ("No ignored images", "eye.slash", "No small images without camera metadata were found.")
-        case .filter(.utility, _)?: return ("No screenshots or documents", "doc.text.viewfinder", "None found (run picasa-cli analyze first; needs macOS 15 or later).")
+        case .filter(.utility, _)?: return ("No screenshots or documents", "doc.text.viewfinder", "None found (run Processing ▸ Analyze Pending Images first; needs macOS 15 or later).")
         case .filter(.starred, _)?: return ("No starred photos", "star", "Star a photo in the viewer (S), or import stars from Picasa.")
         case let .filter(.album, name)?: return ("Album is empty", "rectangle.stack", "“\(name)” has no photos in the scanned folders.")
         case let .filter(.year, name)?: return ("No photos in \(name)", "calendar", "No photo in the library is dated \(name).")
         case let .filter(.folder, name)?: return ("Empty folder", "folder", "“\(name)” has no photos left (or they are hidden in Picasa).")
+        case let .filter(.root, name)?: return ("No photos yet", "externaldrive", "Nothing indexed under “\(name)” yet, or its volume is not mounted.")
         default: return ("No photos", "photo", "Nothing to show here.")
+        }
+    }
+}
+
+/// Filter bar of Library ▸ Last indexed: what the newest-first list is about, and for faces / animals
+/// the frames and what their styles mean.
+struct RecentBar: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Picker("", selection: $model.recentKind) {
+                Label("Index", systemImage: "clock.badge.checkmark").tag(RecentKind.indexed)
+                    .help("Photos and videos in the order they were indexed")
+                Label("Faces", systemImage: "person.crop.square").tag(RecentKind.faces)
+                    .help("Photos whose faces were found last")
+                Label("Animals", systemImage: "pawprint").tag(RecentKind.animals)
+                    .help("Photos whose cats and dogs were found last")
+                Label("Labels", systemImage: "tag").tag(RecentKind.labels)
+                    .help("Photos labelled last by the analysis")
+            }
+            .pickerStyle(.segmented).labelsHidden().fixedSize()
+            Spacer()
+            if model.recentKind == .faces || model.recentKind == .animals {
+                HStack(spacing: 10) {
+                    legend(dashed: false, "By a person")
+                        .help("Drawn or tagged in Picasa, drawn here, or named / confirmed / ignored by a person")
+                    legend(dashed: true, "Automatic")
+                        .help("Found by the detector, not reviewed by anyone yet")
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                FramesToggle(help: "Show the face / animal frames on the thumbnails: solid when a person made or confirmed them, dashed when automatic")
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+    }
+
+    func legend(dashed: Bool, _ text: String) -> some View {
+        let c = GridFrames.detectionColor(model.recentKind == .faces ? .face : .pet, human: !dashed)
+        return HStack(spacing: 4) {
+            RoundedRectangle(cornerRadius: 1)
+                .stroke(Color(nsColor: c), style: StrokeStyle(lineWidth: dashed ? 1.5 : 2.5, dash: dashed ? [3, 2] : []))
+                .frame(width: 14, height: 11)
+            Text(text)
         }
     }
 }
@@ -863,7 +1003,7 @@ struct LabelsView: View {
                 .task(id: [l.label, String(model.revision)]) { rows = (try? await model.library.mediaIdsAndYears(.label(l.label))) ?? [] }
             } else if labels.isEmpty && !loading {
                 ContentUnavailableView("No labels yet", systemImage: "tag",
-                                       description: Text("Run the analysis (picasa-cli analyze) or import Picasa keywords."))
+                                       description: Text("Run the analysis (Processing ▸ Analyze Pending Images) or import Picasa keywords."))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
@@ -882,12 +1022,26 @@ struct LabelsView: View {
                 }
             }
         }
-        .task(id: model.revision) { labels = (try? await model.library.labelSummaries()) ?? []; loading = false; openRequested() }
+        .task(id: model.revision) { await load() }
         .onChange(of: model.openLabel) { openRequested() }
     }
 }
 
 extension LabelsView {
+    /// The precomputed cards at once; rebuilt first when stale — except while a scan keeps changing
+    /// labels (a rebuild takes seconds on a large library): the last cards stay shown meanwhile.
+    func load() async {
+        let lib = model.library
+        let cached = (try? await lib.cachedLabelSummaries()) ?? []
+        if !cached.isEmpty { labels = cached; loading = false; openRequested() }
+        let busy = model.job != nil || model.externalActivity
+        if cached.isEmpty || !busy, (try? await lib.labelInfoStale()) == true {
+            labels = (try? await lib.labelSummaries()) ?? labels
+        }
+        loading = false
+        openRequested()
+    }
+
     /// A link (info panel) asked for a label: open its card, or search it if it has none.
     func openRequested() {
         guard let want = model.openLabel, !labels.isEmpty || !loading else { return }

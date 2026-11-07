@@ -4,6 +4,9 @@ import PicasaCore
 let usage = """
 usage: picasa-cli [--library DIR] [-j N] <command> [args]
 
+-j N and --batch N fix the parallel files and the batch size; without them index and analyze adapt to
+the machine and to the disk of the photos (see the profile command), tuned while they run.
+
 commands:
   scan ROOT... [--exclude NAME|/PATH]...
                           index folders (incremental; reads .picasa.ini, never writes to ROOT).
@@ -14,20 +17,26 @@ commands:
   remove-root PATH        forget a root and its index (photos untouched)
   excludes                list remembered exclusions
   unexclude NAME|/PATH    forget an exclusion (rescan to index that folder again)
-  index [--redo-thumbs] [--min-size N] [--thumb-size N] [--batch N]
+  index [--redo-thumbs] [--min-size N] [--thumb-size N] [--batch N] [--profile NAME]
                           extract metadata + generate thumbnails for pending items, batch by batch
-                          (default 4 parallel reads (-j) and batches of 8: measured on a NAS, more
-                          reads do not go faster and smaller batches lose throughput)
+                          (--profile: this run only, instead of the saved one; -j / --batch: fixed values)
                           (--redo-thumbs: regenerate every thumbnail). Small images are ignored:
                           longest side < --min-size (200), or < --thumb-size (512) without camera
-                          EXIF (other apps' thumbnails). 0 disables a rule
-  analyze [--redo [--include-manual]] [--batch N]
+                          EXIF (other apps' thumbnails). 0 disables a rule. Without them: the sizes
+                          saved in the library (PicasaNext ▸ Settings ▸ Processing)
+  analyze [--redo [--include-manual]] [--batch N] [--profile NAME]
                           one Vision pass on pending images: faces, labels, animals (+ a print per
                           animal, to recognise pets), aesthetics, similar-photo prints; then name
                           suggestions for people and pets, and similar groups
                           (--redo: redo everywhere, keeping what a human decided on faces and
                           animals: names, ignores, confirmations, rejections; --include-manual
-                          drops those decisions too). Batches of 8 by default. Alias: faces
+                          drops those decisions too). Alias: faces
+  profile [auto|ssd|hdd|nas|eco] [--reset-tuning]
+                          show (or set, remembered in the library, shared with the app) the performance
+                          profile, and the plan per root: disk detected, parallel files, batch size.
+                          auto: from the disk (internal/external SSD, hard disk, network share);
+                          ssd/hdd/nas: force a disk kind; eco: 1-2 files at a time.
+                          Values tuned during runs are kept per disk; --reset-tuning forgets them
   import-contacts FILE    import Picasa contacts.xml (person names)
   import-db3 DIR          import a Picasa db3 folder (captions, stars, faces); --no-thumbs to skip its thumbnails
   export [--format picasa|xmp|all] [--dry-run] [PATH]
@@ -43,7 +52,7 @@ commands:
                           people (pets) with the same name (case, accents, spaces ignored), e.g. one
                           person imported from several Picasa contacts: listed, merged with --apply
                           into the one with the most photos
-  geocode [--limit N]     name the places of geotagged photos (town, region, country) with Apple's
+  geocode [--limit N]     (default: the limit saved in the app's Settings, else none) name the places of geotagged photos (town, region, country) with Apple's
                           geocoder: network needed, one request per ~2 km area, throttled by Apple
                           (slow, resumable; names become searchable and show in the viewer)
   suggest                 recompute name suggestions for faces and animals (no file is read)
@@ -87,7 +96,7 @@ func split(_ a: [String], options: Set<String>) -> (positional: [String], values
     }
     return (pos, vals)
 }
-let parsed = split(rest, options: ["--exclude", "--min-size", "--thumb-size", "--threshold", "--batch", "--limit"])
+let parsed = split(rest, options: ["--exclude", "--min-size", "--thumb-size", "--threshold", "--batch", "--limit", "--profile"])
 
 /// One-line, rate-limited progress on stderr.
 final class Ticker: @unchecked Sendable {
@@ -108,68 +117,70 @@ final class Ticker: @unchecked Sendable {
     let jobs = jobs
     let tick = Ticker()
     let t0 = Date()
-    func elapsed() -> String { String(format: "%.1fs", Date().timeIntervalSince(t0)) }
+    @Sendable func elapsed() -> String { String(format: "%.1fs", Date().timeIntervalSince(t0)) }
 
     func scan(_ roots: [String]) async throws {
         guard !roots.isEmpty else { print(usage); exit(2) }
-        for e in parsed.values["--exclude"] ?? [] {
-            let pattern = e.hasPrefix("/") || e.hasPrefix("~") ? URL(fileURLWithPath: (e as NSString).expandingTildeInPath).standardizedFileURL.path : e
-            try await library.addExclude(pattern)
-            print("exclude: \(pattern)")
-        }
-        let scanner = Scanner(library: library, concurrency: min(jobs, 16))
-        for r in roots {
-            let url = URL(fileURLWithPath: (r as NSString).expandingTildeInPath)
-            let res = try await scanner.scan(root: url) { tick($0) }
+        let excludes = parsed.values["--exclude"] ?? []
+        for e in excludes { print("exclude: \(Library.excludePattern(e))") }
+        let urls = roots.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        for (u, i) in zip(urls, urls.indices) {
+            // One root at a time, so each prints its line when done.
+            let res = try await Pipeline.scan(library, roots: [u], excludes: i == 0 ? excludes : [], concurrency: min(jobs, 16)) { tick($0) }[0].result
             tick.end()
-            print("scan \(url.path): \(res.folders) folders, +\(res.added) ~\(res.updated) -\(res.removed), \(res.iniParsed) .picasa.ini (\(elapsed()))")
+            print("scan \(u.path): \(res.folders) folders, +\(res.added) ~\(res.updated) -\(res.removed), \(res.iniParsed) .picasa.ini (\(elapsed()))")
         }
     }
+    /// nil when -j or --batch fix the values; otherwise --profile, or the one saved in the library.
+    func profile() async throws -> ThroughputProfile? {
+        if jobsGiven || parsed.values["--batch"] != nil { return nil }
+        if let name = parsed.values["--profile"]?.last {
+            guard let p = ThroughputProfile(rawValue: name) else { print("unknown profile \(name): auto, ssd, hdd, nas, eco"); exit(2) }
+            return p
+        }
+        return try await library.throughputProfile()
+    }
+    let planLine: @Sendable (String) -> Void = { FileHandle.standardOutput.write("\r\u{1B}[K\($0)\n".data(using: .utf8)!) }
     func index() async throws {
-        if rest.contains("--redo-thumbs") { print("thumbnails: \(try await library.resetThumbnails()) marked for regeneration") }
         var indexer = Indexer(library: library, concurrency: jobsGiven ? jobs : Indexer.defaultConcurrency)
+        indexer.profile = try await profile()
+        indexer.onPlan = planLine
+        try await indexer.useSavedSizes()
         if let v = parsed.values["--batch"]?.last.flatMap(Int.init) { indexer.batch = max(1, v) }
         if let v = parsed.values["--min-size"]?.last.flatMap(Int.init) { indexer.minSize = v }
         if let v = parsed.values["--thumb-size"]?.last.flatMap(Int.init) { indexer.thumbSize = v }
-        let r = try await indexer.run { tick($0) }
+        let r = try await Pipeline.index(indexer, redoThumbs: rest.contains("--redo-thumbs"), log: { print($0) }) { tick($0) }
         tick.end(); print("index: metadata \(r.metadata) · thumbnails \(r.thumbnails) items (\(elapsed()))")
     }
     func analyze() async throws {
-        if rest.contains("--redo") {
-            let manual = rest.contains("--include-manual")
-            let n = try await library.resetFaces(includeManual: manual)
-            _ = try await library.resetAnalysis(includeManual: manual)
-            print("analysis: \(n) images marked for re-analysis")
-        }
         var analyzer = Analyzer(library: library, concurrency: max(1, jobs / 2))
+        analyzer.profile = try await profile()
+        analyzer.onPlan = planLine
         if let v = parsed.values["--batch"]?.last.flatMap(Int.init) { analyzer.batch = max(1, v) }
-        let n = try await analyzer.run { tick($0) }
-        tick.end(); print("analysis: \(n) images (\(elapsed()))")
-        let s = try await FaceEngine(library: library).suggestNames()
-        print("faces: \(s) name suggestions (\(elapsed()))")
-        let p = try await Analyzer(library: library, concurrency: max(1, jobs / 2)).petPrints { tick($0) }
-        tick.end()
-        let ps = try await IdentityEngine.suggest(library: library, kind: .pet, threshold: 0.82)
-        print("pets: \(p) photos printed, \(ps) name suggestions (\(elapsed()))")
-        try await similar()
+        if let t = threshold() { try await library.setSimilarThreshold(t) }
+        _ = try await Pipeline.analyze(analyzer, redo: rest.contains("--redo"), includeManual: rest.contains("--include-manual"),
+                                       log: { tick.end(); print("\($0) (\(elapsed()))") }) { tick($0) }
+    }
+    /// --threshold T: cosine similarity for near-duplicates, remembered in the library
+    /// (calibrate with Tools/calibrate-similar.swift).
+    func threshold() -> Float? {
+        guard let t = parsed.values["--threshold"]?.last.flatMap(Float.init) else { return nil }
+        print("similar: threshold \(t) saved")
+        return t
     }
     func similar() async throws {
-        // --threshold T: cosine similarity for near-duplicates, remembered in the library
-        // (calibrate with Tools/calibrate-similar.swift).
-        if let t = parsed.values["--threshold"]?.last.flatMap(Float.init) {
-            try await library.setSimilarThreshold(t)
-            print("similar: threshold \(t) saved")
-        }
-        let r = try await library.groupSimilar()
+        let r = try await Pipeline.similar(library, threshold: threshold())
         print("similar: \(r) (\(elapsed()))")
     }
 
     switch command {
     case "scan": try await scan(parsed.positional)
     case "rescan":
-        for r in try await library.roots() {
-            guard FileManager.default.fileExists(atPath: r.path) else { print("skip (not found): \(r.path)"); continue }
-            try await scan([r.path])
+        let r = try await Pipeline.rescan(library, concurrency: min(jobs, 16)) { tick($0) }
+        tick.end()
+        for m in r.missing { print("skip (not found): \(m)") }
+        for (root, res) in r.scanned {
+            print("scan \(root): \(res.folders) folders, +\(res.added) ~\(res.updated) -\(res.removed), \(res.iniParsed) .picasa.ini (\(elapsed()))")
         }
     case "roots":
         for r in try await library.roots() {
@@ -186,6 +197,23 @@ final class Ticker: @unchecked Sendable {
     case "unexclude":
         guard let p = parsed.positional.first else { print(usage); exit(2) }
         print(try await library.removeExclude(p) ? "removed \(p) — rescan to index it again" : "\(p) was not excluded")
+    case "profile":
+        if rest.contains("--reset-tuning") { print("tuning: \(try await library.resetTuning()) saved values forgotten") }
+        if let name = parsed.positional.first {
+            guard let p = ThroughputProfile(rawValue: name) else { print("unknown profile \(name): auto, ssd, hdd, nas, eco"); exit(2) }
+            try await library.setThroughputProfile(p)
+        }
+        let p = try await library.throughputProfile()
+        print("profile: \(p.rawValue) (\(p.title)) · machine: \(Pipeline.machineSummary)")
+        for r in try await Pipeline.plans(library, profile: p) {
+            print("\(r.path): \(r.volume.fileSystem), \(r.volume.kind.rawValue) (\(r.volume.mountPoint))")
+            for s in r.stages {
+                print("  \(s.stage.rawValue): \(s.plan.summary)"
+                      + (s.lastRun.map { " · last run: \($0.concurrency) parallel, batches of \($0.batch)" } ?? ""))
+            }
+        }
+        if jobsGiven { print("(-j given: index and analyze use fixed values instead)") }
+        exit(0)
     case "index": try await index()
     case "analyze", "faces": try await analyze()
     case "similar": try await similar()
@@ -196,10 +224,9 @@ final class Ticker: @unchecked Sendable {
         print("contacts: \(n) imported")
     case "import-db3":
         guard let d = rest.first else { print(usage); exit(2) }
-        let r = try await library.importDB3(at: URL(fileURLWithPath: (d as NSString).expandingTildeInPath),
-                                            reuseThumbnails: !rest.contains("--no-thumbs")) { tick($0) }
+        let r = try await Pipeline.importDB3(library, at: URL(fileURLWithPath: (d as NSString).expandingTildeInPath),
+                                             reuseThumbnails: !rest.contains("--no-thumbs")) { tick($0) }
         tick.end(); print("db3: \(r)")
-        try await library.mirrorToCopies(.face) // names imported on hidden copies go to the photo kept
     case "export", "export-ini":
         var format = "picasa"
         var dry = false, only: String?
@@ -212,39 +239,31 @@ final class Ticker: @unchecked Sendable {
             }
             i += 1
         }
-        guard ["picasa", "ini", "xmp", "all"].contains(format) else { print(usage); exit(2) }
-        if format != "xmp" {
-            let r = try await library.exportIni(dryRun: dry, only: only) { tick($0) }
-            tick.end(); print(r)
-            for f in r.failed { print("  failed: \(f.path): \(f.error)") }
-        }
-        if format == "xmp" || format == "all" {
-            let r = try await library.exportXmp(dryRun: dry, only: only) { tick($0) }
-            tick.end(); print(r)
-            for f in r.failed { print("  failed: \(f.path): \(f.error)") }
-        }
+        guard let f = Pipeline.ExportFormat(argument: format) else { print(usage); exit(2) }
+        let r = try await Pipeline.export(library, format: f, dryRun: dry, only: only) { tick($0) }
+        tick.end(); print(r)
+        for f in r.failed { print("  failed: \(f.path): \(f.error)") }
     case "geocode":
-        let n = parsed.values["--limit"]?.last.flatMap(Int.init) ?? .max
+        let saved = try await library.geocodeLimit()
+        let n = parsed.values["--limit"]?.last.flatMap(Int.init) ?? saved ?? .max
         let r = try await Geocoder(library: library).run(limit: n) { tick($0) }
         tick.end(); print(r)
     case "suggest":
-        let f = try await FaceEngine(library: library).suggestNames()
-        let p = try await IdentityEngine.suggest(library: library, kind: .pet, threshold: 0.82)
+        let (f, p) = try await Pipeline.suggest(library)
         print("suggestions: \(f) faces, \(p) animals (\(elapsed()))")
     case "merge-duplicates":
-        for k in [IdentityKind.face, .pet] {
-            let groups = try await library.duplicateOwners(k)
+        let all = try await Pipeline.duplicateNames(library)
+        for (k, groups) in all {
             for g in groups {
                 print("\(k == .face ? "person" : "pet") “\(g[0].name)”: " + g.map { "#\($0.id) (\($0.faces) photos)" }.joined(separator: " + ")
                       + " → #\(g[0].id)")
             }
-            if rest.contains("--apply") {
-                print("merged \(try await library.mergeDuplicates(k, groups)) \(k == .face ? "people" : "pets")")
-            } else if !groups.isEmpty {
-                print("(dry run: add --apply to merge)")
-            }
         }
-        if rest.contains("--apply") { _ = try await FaceEngine(library: library).suggestNames() }
+        if rest.contains("--apply") {
+            print("merged \(try await Pipeline.mergeDuplicates(library, all)) people and pets")
+        } else if all.contains(where: { !$0.groups.isEmpty }) {
+            print("(dry run: add --apply to merge)")
+        }
     case "stats": break
     default: print(usage); exit(2)
     }

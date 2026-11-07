@@ -247,25 +247,53 @@ public struct Indexer: Sendable {
     public var minSize = 200
     public var thumbSize = 512
 
+    /// Adaptive mode (see Throughput.swift): concurrency and batch come from the photos' disk and the
+    /// machine, tuned during the run. nil: the fixed `concurrency` and `batch` above (`-j`, `--batch`).
+    public var profile: ThroughputProfile?
+    /// Called once per volume with the plan chosen for it.
+    public var onPlan: (@Sendable (String) -> Void)?
+
     public init(library: Library, concurrency: Int = Indexer.defaultConcurrency) {
         self.library = library
         self.concurrency = max(1, concurrency)
     }
 
+    public init(library: Library, profile: ThroughputProfile) {
+        self.init(library: library)
+        self.profile = profile
+    }
+
+    func session(_ stage: ThroughputStage) -> ThroughputSession? {
+        guard let profile else { return nil }
+        let s = ThroughputSession(library: library, stage: stage, profile: profile)
+        s.onPlan = onPlan
+        return s
+    }
+
+    /// One batch: the tuned (or fixed) concurrency, files in the order to read them.
+    func plan<T>(_ s: ThroughputSession?, _ work: [T], path: (T) -> String) async -> (concurrency: Int, work: [T]) {
+        guard let s else { return (concurrency, work) }
+        return await s.begin(work, path: path)
+    }
+
     public func extractMetadata(progress: ProgressHandler? = nil) async throws -> Int {
         try await library.retryUnreadable("meta_state")
         var done = 0
+        let tuning = session(.metadata)
         while true {
-            let work = try await library.pending(stateColumn: "meta_state", limit: batch)
-            if work.isEmpty { break }
-            let results = await parallelMap(work, concurrency: concurrency) { item in
+            let pending = try await library.pending(stateColumn: "meta_state", limit: tuning?.batch ?? batch)
+            if pending.isEmpty { break }
+            let (c, work) = await plan(tuning, pending) { $0.url.path }
+            let results = await parallelMap(work, concurrency: c) { item in
                 (item.id, await MetadataReader.read(url: item.url, kind: item.kind))
             }
             try VolumeUnavailable.check(zip(work, results).filter { $0.1.1 == nil }.map(\.0.url))
             try await library.store(metadata: results)
+            tuning?.end(items: results.count)
             done += results.count
             progress?(LibraryProgress(stage: "metadata", done: done, total: nil, current: work.last?.url.path))
         }
+        await tuning?.save()
         try await library.fillMissingDates()
         _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize)
         return done
@@ -279,10 +307,12 @@ public struct Indexer: Sendable {
         try await library.retryUnreadable("thumb_state")
         var (m, t) = (0, 0)
         let store = library.thumbs
+        let (metaTuning, thumbTuning) = (session(.metadata), session(.thumbnails))
         while true {
-            let metaWork = try await library.pending(stateColumn: "meta_state", limit: batch)
-            if !metaWork.isEmpty {
-                let results = await parallelMap(metaWork, concurrency: concurrency) { item in
+            let metaPending = try await library.pending(stateColumn: "meta_state", limit: metaTuning?.batch ?? batch)
+            if !metaPending.isEmpty {
+                let (c, metaWork) = await plan(metaTuning, metaPending) { $0.url.path }
+                let results = await parallelMap(metaWork, concurrency: c) { item in
                     (item.id, await MetadataReader.read(url: item.url, kind: item.kind))
                 }
                 try VolumeUnavailable.check(zip(metaWork, results).filter { $0.1.1 == nil }.map(\.0.url))
@@ -290,21 +320,26 @@ public struct Indexer: Sendable {
                 let ids = metaWork.map(\.id)
                 try await library.fillMissingDates(ids: ids)
                 _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize, ids: ids)
+                metaTuning?.end(items: results.count)
                 m += results.count
                 progress?(LibraryProgress(stage: "metadata", done: m, total: nil, current: metaWork.last?.url.path))
             }
-            let thumbWork = try await library.pending(stateColumn: "thumb_state", limit: batch, metadataRead: true)
-            if !thumbWork.isEmpty {
-                let results = await parallelMap(thumbWork, concurrency: concurrency) { item in
+            let thumbPending = try await library.pending(stateColumn: "thumb_state", limit: thumbTuning?.batch ?? batch, metadataRead: true)
+            if !thumbPending.isEmpty {
+                let (c, thumbWork) = await plan(thumbTuning, thumbPending) { $0.url.path }
+                let results = await parallelMap(thumbWork, concurrency: c) { item in
                     (item.id, await store.generate(id: item.id, url: item.url, kind: item.kind))
                 }
                 try VolumeUnavailable.check(zip(thumbWork, results).filter { $0.1.1 != .done }.map(\.0.url))
                 try await library.markThumbs(results)
+                thumbTuning?.end(items: results.count)
                 t += results.count
                 progress?(LibraryProgress(stage: "thumbnails", done: t, total: nil, current: thumbWork.last?.url.path))
             }
-            if metaWork.isEmpty && thumbWork.isEmpty { break }
+            if metaPending.isEmpty && thumbPending.isEmpty { break }
         }
+        await metaTuning?.save()
+        await thumbTuning?.save()
         try await library.fillMissingDates()
         _ = try await library.classifySmall(minSize: minSize, thumbSize: thumbSize)
         return (m, t)
@@ -314,17 +349,21 @@ public struct Indexer: Sendable {
         try await library.retryUnreadable("thumb_state")
         var done = 0
         let store = library.thumbs
+        let tuning = session(.thumbnails)
         while true {
-            let work = try await library.pending(stateColumn: "thumb_state", limit: batch)
-            if work.isEmpty { break }
-            let results = await parallelMap(work, concurrency: concurrency) { item in
+            let pending = try await library.pending(stateColumn: "thumb_state", limit: tuning?.batch ?? batch)
+            if pending.isEmpty { break }
+            let (c, work) = await plan(tuning, pending) { $0.url.path }
+            let results = await parallelMap(work, concurrency: c) { item in
                 (item.id, await store.generate(id: item.id, url: item.url, kind: item.kind))
             }
             try VolumeUnavailable.check(zip(work, results).filter { $0.1.1 != .done }.map(\.0.url))
             try await library.markThumbs(results)
+            tuning?.end(items: results.count)
             done += results.count
             progress?(LibraryProgress(stage: "thumbnails", done: done, total: nil, current: work.last?.url.path))
         }
+        await tuning?.save()
         return done
     }
 }

@@ -7,7 +7,7 @@ import Vision
 /// Face recognition helpers and name suggestion.
 /// Picasa's Neven engine is replaced by Apple Vision: faces are detected by `Analyzer` on a downscaled
 /// copy, each face crop gets a Vision feature print, and unnamed faces are matched to the people
-/// already named (in Picasa or here) by cosine similarity to per-person centroids.
+/// already named (in Picasa or here) by cosine similarity to their nearest named face.
 public struct FaceEngine: Sendable {
     public let library: Library
     public var concurrency: Int
@@ -51,76 +51,91 @@ public struct FaceEngine: Sendable {
     }
 
     /// For every unnamed face with a print, sets suggested_person_id to the most similar person
-    /// (cosine similarity to the person's centroid) when above the threshold and not rejected
+    /// (cosine similarity to their nearest named face) when above the threshold and not rejected
     /// by the user for that face. Returns suggestions made.
     public func suggestNames() async throws -> Int {
         try await IdentityEngine.suggest(library: library, kind: .face, threshold: suggestThreshold)
     }
 }
 
-/// Name suggestions shared by faces and pets: each unnamed item goes to the most similar named
-/// one (cosine similarity to its centroid) when above the threshold and not rejected for it.
+/// Name suggestions shared by faces and pets: each unnamed item goes to the person / pet owning the
+/// most similar named item (nearest example) when above the threshold and not rejected for it.
 public enum IdentityEngine {
-    /// How much closer to a known counter-example than to the person's average face a face must be
+    /// How much closer to a known counter-example than to the person's nearest face a face must be
     /// for that person to be ruled out.
     static let counterMargin: Float = 0
+    /// Unnamed items scored per matrix product: keeps the score matrix to a few tens of MB.
+    static let chunkSize = 512
 
-    /// Suggests a name for every unnamed face (animal): the person whose average face (centroid) is
-    /// the most similar, above `threshold`. Faces a human said were *not* someone (rejected, or taken
-    /// away from them) are counter-examples: a face that looks more like one of them than like the
-    /// person's average is not suggested for that person — so correcting a few wrong suggestions
-    /// also clears their look-alikes — and the next best person is tried instead.
+    /// Suggests a name for every unnamed face (animal): the person owning the most similar named
+    /// face, above `threshold`. Nearest example rather than each person's average face: the prints
+    /// are generic image prints, so a person's looks are spread out and an average matches only the
+    /// faces near its middle (one named face found ~4% of that person's others, vs ~70% this way).
+    /// Faces a human said were *not* someone (rejected, or taken away from them) are counter-examples:
+    /// a face that looks more like one of them than like the person's nearest face is not suggested
+    /// for that person — so correcting a few wrong suggestions also clears their look-alikes — and
+    /// the next best person is tried instead.
     public static func suggest(library: Library, kind: IdentityKind, threshold: Float) async throws -> Int {
-        let (persons, centroids, dim) = try await library.centroids(kind)
+        let (persons, examples, starts, dim) = try await library.namedExamples(kind)
         guard !persons.isEmpty, dim > 0 else { return 0 }
-        let np = persons.count
+        let np = persons.count, ne = starts[np]
         let column = Dictionary(uniqueKeysWithValues: persons.enumerated().map { ($1, $0) })
-        // centroidsᵀ [dim × persons] for vDSP_mmul.
-        var centroidsT = [Float](repeating: 0, count: centroids.count)
-        vDSP_mtrans(centroids, 1, &centroidsT, 1, vDSP_Length(dim), vDSP_Length(np))
+        // examplesᵀ [dim × examples] for vDSP_mmul.
+        var examplesT = [Float](repeating: 0, count: examples.count)
+        vDSP_mtrans(examples, 1, &examplesT, 1, vDSP_Length(dim), vDSP_Length(ne))
         // Counter-examples: prints of faces rejected for a person, with that person.
         let negatives = try await library.counterExamples(kind, dim: dim).filter { column[$0.owner] != nil }
         var negT = [Float](repeating: 0, count: negatives.count * dim)
         if !negatives.isEmpty {
             vDSP_mtrans(negatives.flatMap(\.print), 1, &negT, 1, vDSP_Length(dim), vDSP_Length(negatives.count))
         }
+        let negColumn = negatives.map { column[$0.owner]! }
+        let nn = negatives.count
         var made = 0
         var after: Int64 = 0
+        var scores = [Float](repeating: 0, count: chunkSize * ne)
+        var neg = [Float](repeating: 0, count: chunkSize * nn)
+        var row = [Float](repeating: 0, count: np), worst = [Float](repeating: -1, count: np)
         while true {
             let batch = try await library.unnamedPrints(kind, after: after, limit: 4096, dim: dim)
             guard let lastId = try await library.lastUnnamedPrintId(kind, after: after, limit: 4096) else { break }
             after = lastId
-            if batch.isEmpty { continue }
-            let flat = batch.flatMap(\.print)
-            // scores[b × p] = prints[b × d] · centroidsᵀ[d × p]
-            var scores = [Float](repeating: 0, count: batch.count * np)
-            vDSP_mmul(flat, 1, centroidsT, 1, &scores, 1, vDSP_Length(batch.count), vDSP_Length(np), vDSP_Length(dim))
-            // neg[b × n]: similarity to each counter-example.
-            var neg = [Float](repeating: 0, count: batch.count * negatives.count)
-            if !negatives.isEmpty {
-                vDSP_mmul(flat, 1, negT, 1, &neg, 1, vDSP_Length(batch.count), vDSP_Length(negatives.count), vDSP_Length(dim))
-            }
             var updates: [(Int64, Int64?)] = []
-            for (i, f) in batch.enumerated() {
-                // Closest counter-example per person for this face.
-                var worst: [Int: Float] = [:]
-                for (k, n) in negatives.enumerated() {
-                    let v = neg[i * negatives.count + k]
-                    if v > (worst[column[n.owner]!] ?? -1) { worst[column[n.owner]!] = v }
+            for c in stride(from: 0, to: batch.count, by: chunkSize) {
+                let chunk = batch[c ..< min(c + chunkSize, batch.count)]
+                let nb = chunk.count
+                let flat = chunk.flatMap(\.print)
+                // scores[b × e] = prints[b × d] · examplesᵀ[d × e]
+                vDSP_mmul(flat, 1, examplesT, 1, &scores, 1, vDSP_Length(nb), vDSP_Length(ne), vDSP_Length(dim))
+                // neg[b × n]: similarity to each counter-example.
+                if nn > 0 {
+                    vDSP_mmul(flat, 1, negT, 1, &neg, 1, vDSP_Length(nb), vDSP_Length(nn), vDSP_Length(dim))
                 }
-                // Best person not ruled out (rejected for this very face, or closer to a counter-example).
-                let row = (0..<np).map { scores[i * np + $0] }
-                var pick: Int64?
-                for p in row.indices.sorted(by: { row[$0] > row[$1] }).prefix(3) {
-                    guard row[p] >= threshold else { break }
-                    if persons[p] == f.rejected { continue }
-                    if let w = worst[p], w >= row[p] + counterMargin { continue }
-                    pick = persons[p]; break
+                for (i, f) in chunk.enumerated() {
+                    // Similarity to each person: that of their nearest named example.
+                    scores.withUnsafeBufferPointer { s in
+                        for p in 0..<np {
+                            var m: Float = -1
+                            vDSP_maxv(s.baseAddress! + i * ne + starts[p], 1, &m, vDSP_Length(starts[p + 1] - starts[p]))
+                            row[p] = m
+                        }
+                    }
+                    // Closest counter-example per person for this face.
+                    for p in 0..<np { worst[p] = -1 }
+                    for k in 0..<nn where neg[i * nn + k] > worst[negColumn[k]] { worst[negColumn[k]] = neg[i * nn + k] }
+                    // Best person not ruled out (rejected for this very face, or closer to a counter-example).
+                    var pick: Int64?
+                    for p in row.indices.sorted(by: { row[$0] > row[$1] }).prefix(3) {
+                        guard row[p] >= threshold else { break }
+                        if persons[p] == f.rejected { continue }
+                        if worst[p] > -1, worst[p] >= row[p] + counterMargin { continue }
+                        pick = persons[p]; break
+                    }
+                    updates.append((f.id, pick))
                 }
-                updates.append((f.id, pick))
             }
             made += updates.filter { $0.1 != nil }.count
-            try await library.storeSuggestions(kind, updates)
+            if !updates.isEmpty { try await library.storeSuggestions(kind, updates) }
         }
         return made
     }
