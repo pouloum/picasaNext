@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" width="128" alt="PicasaNext logo"></p>
+
 # PicasaNext
 
 A native macOS photo library for people who organised their photos in Picasa and never found a replacement.
