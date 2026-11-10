@@ -1,0 +1,64 @@
+# Builds the app on GitHub's macOS runner for each version tag (v1.2.0, …),
+# attests where the zip came from, and publishes it as a GitHub release.
+# Anyone can then check a download with:
+#   gh attestation verify PicasaNext-<version>-arm64.zip -R pouloum/picasaNext
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign the attestation
+  attestations: write   # store the attestation
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun swift --version
+
+      - name: Version from the tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          plutil -replace CFBundleShortVersionString -string "$VERSION" Resources/Info.plist
+          plutil -replace CFBundleVersion -string "${GITHUB_RUN_NUMBER}" Resources/Info.plist
+
+      - name: Tests
+        run: TESTS=1 ./build.sh debug
+
+      - name: Build
+        run: ./build.sh release
+
+      - name: Zip
+        run: |
+          ZIP="PicasaNext-${VERSION}-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent build/release/PicasaNext.app "$ZIP"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          echo "SHA256=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.ZIP }}
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          sed -e "s/{{VERSION}}/${VERSION}/g" \
+              -e "s/{{SHA256}}/${SHA256}/g" \
+              -e "s/{{TAG}}/${GITHUB_REF_NAME}/g" \
+              -e "s/{{PREV}}/${PREV}/g" \
+              .github/release-notes.md > notes.md
+          gh release create "$GITHUB_REF_NAME" "$ZIP" --title "PicasaNext ${VERSION}" --notes-file notes.md

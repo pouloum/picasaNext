@@ -33,7 +33,7 @@ Not there yet: rendering Picasa's edits, slideshow, creating albums, sharing.
 
 ## Download
 
-**[PicasaNext 1.1 for Apple Silicon Macs](https://github.com/pouloum/picasaNext/releases/latest)** (macOS 14 or later). Unzip, drag `PicasaNext.app` to Applications.
+**[Latest PicasaNext for Apple Silicon Macs](https://github.com/pouloum/picasaNext/releases/latest)** (macOS 14 or later). Unzip, drag `PicasaNext.app` to Applications.
 
 The app is not notarized by Apple: the first time, macOS blocks it. Open **System Settings ▸ Privacy & Security**, click **Open Anyway** next to PicasaNext, and confirm. This is needed only once. The [release notes](https://github.com/pouloum/picasaNext/releases/latest) have the details.
 
