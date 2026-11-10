@@ -31,7 +31,13 @@ PicasaNext was built for one real library: 207,000 files, 780 GB, photos from 20
 
 Not there yet: rendering Picasa's edits, slideshow, creating albums, sharing.
 
-## Requirements
+## Download
+
+**[PicasaNext 1.1 for Apple Silicon Macs](https://github.com/pouloum/picasaNext/releases/latest)** (macOS 14 or later). Unzip, drag `PicasaNext.app` to Applications.
+
+The app is not notarized by Apple: the first time, macOS blocks it. Open **System Settings ▸ Privacy & Security**, click **Open Anyway** next to PicasaNext, and confirm. This is needed only once. The [release notes](https://github.com/pouloum/picasaNext/releases/latest) have the details.
+
+## Requirements to build
 
 - macOS 14 or later (some analysis features need macOS 15)
 - Xcode 16 or later to build (tested with Xcode 26.2 / Swift 6.2)
