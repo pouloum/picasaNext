@@ -860,9 +860,9 @@ func nextBatch(_ w: (@escaping @Sendable (FolderWatcher.Batch) -> Void) -> Folde
 do {
     let fm = FileManager.default
     let root = tmp.appendingPathComponent("watched")
-    func touch(_ rel: String) throws {
+    @Sendable func touch(_ rel: String) throws {
         let u = root.appendingPathComponent(rel)
-        try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("x".utf8).write(to: u)
     }
     try touch("a/x.jpg"); try touch("d/old.jpg"); try touch("d/sub/old2.jpg"); try touch(".hidden/h.jpg")
