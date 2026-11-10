@@ -37,6 +37,11 @@ Not there yet: rendering Picasa's edits, slideshow, creating albums, sharing.
 
 The app is not notarized by Apple: the first time, macOS blocks it. Open **System Settings ▸ Privacy & Security**, click **Open Anyway** next to PicasaNext, and confirm. This is needed only once. The [release notes](https://github.com/pouloum/picasaNext/releases/latest) have the details.
 
+Is it safe? Two independent checks:
+
+- **Built from this code**: releases are built by GitHub Actions from the tagged source, not on the author's machine, and GitHub signs a record of where each zip came from. Check it with `gh attestation verify PicasaNext-<version>-arm64.zip -R pouloum/picasaNext`.
+- **No known malware**: [VirusTotal report for PicasaNext 1.1.2](https://www.virustotal.com/gui/file/cee43472c71a787efd199523ac4c0789262109454541b2a4d6a2db74e63d915f) (0 detections out of 66 engines).
+
 ## Requirements to build
 
 - macOS 14 or later (some analysis features need macOS 15)
