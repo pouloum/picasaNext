@@ -77,13 +77,13 @@ This was done for interoperability only, as allowed in the EU (Directive 2009/24
 
 ## Project history
 
-The history has five commits, one per stage of the story. Each is a snapshot of the real development history (73 commits, from 20 October to 7 November 2026), with its original date. Before publication, these were removed:
+The history starts with five commits, one per stage of the story. Each is a snapshot of the real development history (73 commits, from 20 October to 7 November 2026), with its original date. Before publication, these were removed:
 
 - the static-analysis notes and anything taken from the Picasa binary
 - personal data (folder names, people's names, paths)
 - internal working notes
 
-The code itself was not rewritten. Each stage has a tag:
+The code itself was not rewritten. Each stage has a tag, and so does each release published since:
 
 | Tag | What |
 |---|---|
@@ -92,6 +92,8 @@ The code itself was not rewritten. Each stage has a tag:
 | `v0.3` | The real library: NAS, benchmark, copies |
 | `v1.0` | First version (five days, ~6 hours of AI work) |
 | `v1.1` | Continuous indexing, removable disks, better face suggestions |
+| `v1.1.1` | Release workflow: built, attested and published by GitHub Actions; version 1.1 in the app bundle, logo and download section in the README |
+| `v1.1.2` | Test fix for Swift 6.3 (Sendable file helper), first release built by the workflow |
 
 ## Status
 
